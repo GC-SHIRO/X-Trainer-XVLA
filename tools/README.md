@@ -50,7 +50,8 @@ ModelScope 版本下载相同的 checkpoint，并保存到相同目录：
 bash tools/download_xvla_weights_modelscope.sh
 ```
 
-ModelScope 脚本只下载与 Hugging Face 共享的 XVLA 文件，并在完成后校验 `config.json`、20 维动作头、内置
+两个下载脚本都下载远端模型仓库的完整快照，不筛选文件；因此 `model.safetensors`、配置、processor、README 以及
+ModelScope 的 `configuration.json` 等发布文件都会保留在本地。完成后会校验 `config.json`、20 维动作头、内置
 Florence-2 配置、`model.safetensors` 和前后处理器 JSON。训练脚本统一读取 `models/xvla-base`，无需修改配置。
 
 国内镜像：

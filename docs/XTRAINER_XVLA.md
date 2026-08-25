@@ -80,8 +80,8 @@ bash tools/download_xvla_weights_hf.sh
 bash tools/download_xvla_weights_modelscope.sh
 ```
 
-两个脚本均下载 `lerobot/xvla-base` 到 `models/xvla-base`，核心权重、配置和 processor 文件一致，因此训练入口
-无需区分下载来源。国内网络也可以为 Hugging Face 指定镜像：
+两个脚本均将 `lerobot/xvla-base` 的完整远端仓库快照下载到 `models/xvla-base`，不筛选模型、配置、processor 或
+仓库元数据文件；因此训练入口无需区分下载来源。国内网络也可以为 Hugging Face 指定镜像：
 
 ```bash
 bash tools/download_xvla_weights_hf.sh --endpoint https://hf-mirror.com

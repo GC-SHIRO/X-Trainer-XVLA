@@ -14,7 +14,7 @@ usage() {
   cat <<'USAGE'
 Usage: bash tools/download_xvla_weights_hf.sh [OPTIONS]
 
-Download the official XVLA base checkpoint from Hugging Face.
+Download the complete official XVLA base-model repository from Hugging Face.
 
 Options:
   --repo-id ID          Model ID (default: lerobot/xvla-base)

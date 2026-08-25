@@ -13,8 +13,8 @@ usage() {
   cat <<'USAGE'
 Usage: bash tools/download_xvla_weights_modelscope.sh [OPTIONS]
 
-Download the official XVLA base checkpoint from ModelScope. The default model
-and destination match tools/download_xvla_weights_hf.sh exactly.
+Download the complete official XVLA base-model repository from ModelScope. The
+default model and destination match tools/download_xvla_weights_hf.sh exactly.
 
 Options:
   --model-id ID         ModelScope model ID (default: lerobot/xvla-base)
@@ -66,24 +66,21 @@ if token:
 
     HubApi().login(token)
 
-# Keep the local checkpoint payload aligned with the Hugging Face repository.
-# ModelScope adds a service-specific configuration.json that LeRobot does not
-# consume, so only the shared XVLA payload is downloaded.
-shared_files = [
-    "README.md",
-    "config.json",
-    "model.safetensors",
-    "policy_postprocessor.json",
-    "policy_preprocessor.json",
-]
+# Download the whole remote repository. Do not filter files here: the local
+# ModelScope snapshot must retain every checkpoint, configuration, processor,
+# and repository metadata artifact published by the upstream model.
 downloaded_path = snapshot_download(
     model_id=model_id,
     revision=revision or None,
     local_dir=str(output_dir),
-    allow_patterns=shared_files,
 )
 
-required_files = shared_files[1:]
+required_files = (
+    "config.json",
+    "model.safetensors",
+    "policy_postprocessor.json",
+    "policy_preprocessor.json",
+)
 missing = [name for name in required_files if not (output_dir / name).is_file()]
 empty = [name for name in required_files if (output_dir / name).is_file() and (output_dir / name).stat().st_size == 0]
 if missing or empty:

@@ -48,6 +48,8 @@ def test_modelscope_downloader_matches_huggingface_layout():
     assert '"policy_preprocessor.json"' in script
     assert '"policy_postprocessor.json"' in script
     assert 'config.get("type") != "xvla"' in script
+    assert "allow_patterns" not in script
+    assert "whole remote repository" in script
 
 
 def test_deploy_config_matches_xvla_training_contract():
