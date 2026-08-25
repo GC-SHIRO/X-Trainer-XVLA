@@ -16,6 +16,7 @@ from deploy.xtrainer.real.environment import (
 )
 from scripts.xtrainer.run_real import (
     ControlActionLog,
+    _apply_binary_gripper_close,
     _extract_action_chunk,
     _policy_payload,
     _rate_limit_action,
@@ -153,6 +154,19 @@ def test_final_rate_limit_caps_action_change():
     np.testing.assert_allclose(limited, 0.2)
 
 
+def test_bin_gripper_smoothly_closes_values_below_threshold():
+    action = np.full(14, 0.8)
+    action[6] = 0.49
+    action[13] = 0.2
+    previous = np.full(14, 0.8)
+
+    transformed = _apply_binary_gripper_close(action, previous)
+
+    assert transformed[6] == pytest.approx(0.75)
+    assert transformed[13] == pytest.approx(0.75)
+    assert transformed[0] == pytest.approx(0.8)
+
+
 def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     args = parse_args(["--host", "127.0.0.1"])
 
@@ -164,6 +178,7 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.observation_similarity_epsilon is None
     assert args.execute is False
     assert args.log_control is False
+    assert args.bin_gripper is False
     assert args.control_log_path is None
     assert math.isinf(args.max_joint_delta)
     assert math.isinf(args.max_gripper_delta)

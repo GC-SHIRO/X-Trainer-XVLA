@@ -46,6 +46,11 @@ from deploy.xtrainer.real.hardware.realsense_camera import (
 from deploy.xtrainer.websocket_client_policy import XTrainerWebSocketPolicyClient
 
 ACTION_DIM = 14
+GRIPPER_ACTION_INDICES = (6, 13)
+BIN_GRIPPER_THRESHOLD = 0.5
+# Normalized gripper movement per control step while --bin-gripper is active.
+# At the default 20 Hz this takes one second to travel the full [1, 0] range.
+BIN_GRIPPER_CLOSE_STEP = 0.05
 DEFAULT_CONTROL_LOG_DIR = REPO_ROOT / "outputs" / "xtrainer" / "control_logs"
 _LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +233,7 @@ async def run_control_loop(
     max_steps: int,
     request_timeout_s: float,
     max_delta_per_step: float,
+    bin_gripper: bool = False,
     control_log: ControlActionLog | None = None,
     monotonic_fn: Any = time.monotonic,
     sleep_fn: Any = asyncio.sleep,
@@ -241,9 +247,10 @@ async def run_control_loop(
     that measured pose as a hold target, and waits for the next inference
     result before issuing another policy action.
     """
+    initial_observation = environment.get_observation()
     initial_result = await _request_action_chunk(
         policy,
-        environment.get_observation(),
+        initial_observation,
         action_horizon=action_horizon,
         observation_timestep=0,
         request_timeout_s=request_timeout_s,
@@ -255,6 +262,7 @@ async def run_control_loop(
         action_horizon,
     )
     last_sent_action: np.ndarray | None = None
+    last_gripper_action = np.asarray(initial_observation[STATE_KEY], dtype=np.float64).copy()
     period = 1.0 / control_hz
     result = initial_result
     step = 0
@@ -265,11 +273,17 @@ async def run_control_loop(
             if step >= max_steps:
                 break
             queued_action = np.asarray(action, dtype=np.float64).copy()
+            bin_gripper_action = (
+                _apply_binary_gripper_close(queued_action, last_gripper_action)
+                if bin_gripper
+                else queued_action
+            )
             rate_limited_action = _rate_limit_action(
-                queued_action, last_sent_action, max_delta_per_step
+                bin_gripper_action, last_sent_action, max_delta_per_step
             )
             applied_action = environment.apply_action(rate_limited_action, pace=False)
             last_sent_action = np.asarray(applied_action, dtype=np.float64).copy()
+            last_gripper_action = last_sent_action
             if control_log is not None:
                 control_log.write(
                     "control_step",
@@ -277,6 +291,7 @@ async def run_control_loop(
                     source_observation_timestep=result.observation_timestep,
                     used_fallback=False,
                     queued_action=queued_action.tolist(),
+                    bin_gripper_action=bin_gripper_action.tolist() if bin_gripper else None,
                     rate_limited_action=rate_limited_action.tolist(),
                     applied_action=last_sent_action.tolist(),
                 )
@@ -295,6 +310,7 @@ async def run_control_loop(
         hold_action = np.asarray(observation[STATE_KEY], dtype=np.float64)
         applied_hold_action = environment.apply_action(hold_action, pace=False)
         last_sent_action = np.asarray(applied_hold_action, dtype=np.float64).copy()
+        last_gripper_action = last_sent_action
         if control_log is not None:
             control_log.write(
                 "control_hold",
@@ -316,6 +332,16 @@ async def run_control_loop(
         )
 
     _LOGGER.info("Reached --max-steps=%d; ending the control loop", max_steps)
+
+
+def _apply_binary_gripper_close(action: np.ndarray, previous_action: np.ndarray) -> np.ndarray:
+    """Turn policy gripper values below 0.5 into a smooth close-to-zero command."""
+
+    transformed = np.asarray(action, dtype=np.float64).copy()
+    for index in GRIPPER_ACTION_INDICES:
+        if transformed[index] < BIN_GRIPPER_THRESHOLD:
+            transformed[index] = max(0.0, previous_action[index] - BIN_GRIPPER_CLOSE_STEP)
+    return transformed
 
 
 def _validate_server_metadata(metadata: dict[str, Any], expected_domain_id: int) -> dict[str, Any]:
@@ -467,6 +493,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional final client-side action delta limit; <=0 disables it",
     )
     parser.add_argument(
+        "--bin-gripper",
+        action="store_true",
+        help=(
+            "For either gripper, treat a policy value below 0.5 as close and ramp it "
+            f"toward 0 by {BIN_GRIPPER_CLOSE_STEP:g} per control step"
+        ),
+    )
+    parser.add_argument(
         "--log-control",
         action="store_true",
         help=(
@@ -562,6 +596,7 @@ async def run(
             max_steps=args.max_steps,
             request_timeout_s=args.request_timeout,
             max_delta_per_step=args.max_delta_per_step,
+            bin_gripper=args.bin_gripper,
             control_log=control_log,
         )
     finally:
