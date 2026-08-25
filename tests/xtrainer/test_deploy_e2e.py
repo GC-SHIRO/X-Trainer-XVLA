@@ -119,8 +119,6 @@ def _run_args(port: int, *, max_steps: int = 4):
             str(max_steps),
             "--control-hz",
             "1000",
-            "--prefetch-threshold",
-            "0",
         ]
     )
 

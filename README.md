@@ -84,8 +84,8 @@ python scripts/xtrainer/run_real.py \
   --task "将试管放入试管架" \
   --domain-id 19 \
   --action-horizon 32 \
-  --max-joint-delta 0.05 \
-  --max-gripper-delta 0.03 \
+  --max-joint-delta 0.1 \
+  --max-gripper-delta 0.1 \
   --execute
 ```
 

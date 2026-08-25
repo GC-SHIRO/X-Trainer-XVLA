@@ -16,13 +16,9 @@ from deploy.xtrainer.real.environment import (
 )
 from scripts.xtrainer.run_real import (
     ControlActionLog,
-    InferenceResult,
-    TimedAction,
     _extract_action_chunk,
-    _merge_action_queue,
     _policy_payload,
     _rate_limit_action,
-    _should_prefetch,
     parse_args,
     run,
     run_control_loop,
@@ -149,37 +145,10 @@ def test_policy_payload_applies_top_camera_crop_and_flips_only():
     np.testing.assert_array_equal(payload["images"]["right_wrist"], right_wrist_image)
 
 
-def test_merge_drops_stale_actions_and_blends_matching_timesteps():
-    old = {
-        timestep: TimedAction(np.zeros(14), observation_timestep=0, timestep=timestep)
-        for timestep in (5, 6, 7)
-    }
-    incoming = InferenceResult(actions=np.full((4, 14), 10.0), observation_timestep=4)
+def test_final_rate_limit_caps_action_change():
+    target = np.full(14, 7.0)
 
-    merged = _merge_action_queue(old, incoming, current_timestep=5)
-
-    assert tuple(merged) == (5, 6, 7)
-    np.testing.assert_allclose(merged[5].action, 7.0)
-    np.testing.assert_allclose(merged[6].action, 7.0)
-    np.testing.assert_allclose(merged[7].action, 7.0)
-    assert all(action.observation_timestep == 4 for action in merged.values())
-
-
-def test_merge_uses_new_action_directly_after_overlap():
-    old = {3: TimedAction(np.zeros(14), observation_timestep=0, timestep=3)}
-    incoming = InferenceResult(actions=np.full((3, 14), 10.0), observation_timestep=3)
-
-    merged = _merge_action_queue(old, incoming, current_timestep=3)
-
-    np.testing.assert_allclose(merged[3].action, 7.0)
-    np.testing.assert_allclose(merged[4].action, 10.0)
-    np.testing.assert_allclose(merged[5].action, 10.0)
-
-
-def test_final_rate_limit_runs_after_blending():
-    blended = np.full(14, 7.0)
-
-    limited = _rate_limit_action(blended, np.zeros(14), max_delta_per_step=0.2)
+    limited = _rate_limit_action(target, np.zeros(14), max_delta_per_step=0.2)
 
     np.testing.assert_allclose(limited, 0.2)
 
@@ -190,7 +159,6 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.camera_top_serial == "409122273405"
     assert args.camera_left_wrist_serial == "412622272997"
     assert args.camera_right_wrist_serial == "412622271417"
-    assert args.prefetch_threshold == pytest.approx(0.7)
     assert args.action_horizon == 32
     assert args.domain_id == 19
     assert args.observation_similarity_epsilon is None
@@ -213,7 +181,7 @@ def test_cli_accepts_optional_client_control_log_path(tmp_path):
     assert args.control_log_path == log_path
 
 
-def test_cli_accepts_reference_hardware_option_names_and_prefetch_remaining():
+def test_cli_accepts_reference_hardware_option_names():
     args = parse_args(
         [
             "--host",
@@ -228,8 +196,6 @@ def test_cli_accepts_reference_hardware_option_names_and_prefetch_remaining():
             "left",
             "--right-wrist-camera-serial",
             "right",
-            "--prefetch-remaining",
-            "2",
         ]
     )
 
@@ -240,12 +206,7 @@ def test_cli_accepts_reference_hardware_option_names_and_prefetch_remaining():
         "left",
         "right",
     )
-    assert args.prefetch_remaining == 2
-    assert _should_prefetch(2, 5, 0.7, args.prefetch_remaining)
-    assert not _should_prefetch(3, 5, 0.7, args.prefetch_remaining)
-
-
-def test_control_loop_blends_returned_prefetch_and_keeps_one_request_in_flight():
+def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
     async def exercise():
         policy = MockPolicy([np.zeros((4, 14)), np.full((4, 14), 10.0)])
         environment = MockEnvironment()
@@ -259,8 +220,7 @@ def test_control_loop_blends_returned_prefetch_and_keeps_one_request_in_flight()
             environment,
             action_horizon=4,
             control_hz=20.0,
-            max_steps=3,
-            prefetch_threshold=0.5,
+            max_steps=5,
             request_timeout_s=1.0,
             max_delta_per_step=0.0,
             monotonic_fn=lambda: 0.0,
@@ -270,13 +230,50 @@ def test_control_loop_blends_returned_prefetch_and_keeps_one_request_in_flight()
 
     policy, environment = asyncio.run(exercise())
 
-    assert len(environment.actions) == 3
-    np.testing.assert_allclose(environment.actions[0], 0.0)
-    np.testing.assert_allclose(environment.actions[1], 0.0)
-    np.testing.assert_allclose(environment.actions[2], 7.0)
+    assert len(environment.actions) == 6
+    np.testing.assert_allclose(environment.actions[:5], 0.0)
+    np.testing.assert_allclose(environment.actions[5], 10.0)
+    assert policy.infer_calls == 2
     assert policy.max_active_infers == 1
     assert set(policy.payloads[0]) == {"state", "images", "task"}
     assert set(policy.payloads[0]["images"]) == {"top", "left_wrist", "right_wrist"}
+
+
+def test_control_loop_records_hold_without_fallback(tmp_path):
+    async def exercise(log_path):
+        policy = MockPolicy([np.zeros((2, 14)), np.ones((2, 14))])
+        environment = MockEnvironment()
+        control_log = ControlActionLog(log_path)
+        try:
+            await run_control_loop(
+                policy,
+                environment,
+                action_horizon=2,
+                control_hz=1000.0,
+                max_steps=3,
+                request_timeout_s=1.0,
+                max_delta_per_step=0.0,
+                control_log=control_log,
+            )
+        finally:
+            control_log.close()
+
+    log_path = tmp_path / "control.jsonl"
+    asyncio.run(exercise(log_path))
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+    assert [record["event"] for record in records] == [
+        "inference_request",
+        "inference_response",
+        "control_step",
+        "control_step",
+        "control_hold",
+        "inference_request",
+        "inference_response",
+        "control_step",
+    ]
+    assert records[4]["control_timestep"] == 2
+    assert all(not record.get("used_fallback", False) for record in records)
 
 
 def test_client_control_log_records_state_response_and_applied_action(tmp_path):
@@ -291,7 +288,6 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
                 action_horizon=2,
                 control_hz=100.0,
                 max_steps=1,
-                prefetch_threshold=0.0,
                 request_timeout_s=1.0,
                 max_delta_per_step=0.0,
                 control_log=control_log,
@@ -320,7 +316,7 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
     assert records[2]["applied_action"] == [0.25] * 14
 
 
-def test_prefetch_timeout_closes_policy_and_hardware():
+def test_chunk_request_timeout_closes_policy_and_hardware():
     args = parse_args(
         [
             "--host",
@@ -332,8 +328,6 @@ def test_prefetch_timeout_closes_policy_and_hardware():
             "5",
             "--control-hz",
             "100",
-            "--prefetch-threshold",
-            "0.5",
             "--request-timeout",
             "0.001",
         ]
@@ -378,8 +372,6 @@ def test_run_applies_reset_pose_from_policy_metadata_and_cleans_up():
             "1",
             "--control-hz",
             "1000",
-            "--prefetch-threshold",
-            "0",
         ]
     )
     policy = MockPolicy([np.zeros((1, 14))], metadata=metadata)

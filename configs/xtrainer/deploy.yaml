@@ -24,10 +24,6 @@ xtrainer:
   action_dim: 14
   state_dim: 14
   chunk_size: 32
-  prefetch_threshold: 0.7
-  overlap_blend:
-    old_weight: 0.3
-    new_weight: 0.7
   observation_keys:
     state: observation.state
     images:
@@ -100,8 +96,6 @@ safety:
   ramp_max_steps: 100
   gripper_update_threshold: 0.02
   servo_step_limit: 0.9
-  max_switch_delta_rad: 0.12
-  switch_blend_steps: 5
   max_delta_per_step_rad: 0.0
   joint_position_limit_rad: [-6.283185307179586, 6.283185307179586]
   gripper_limit: [0.0, 1.0]

@@ -46,17 +46,8 @@ from deploy.xtrainer.real.hardware.realsense_camera import (
 from deploy.xtrainer.websocket_client_policy import XTrainerWebSocketPolicyClient
 
 ACTION_DIM = 14
-OLD_ACTION_WEIGHT = 0.3
-NEW_ACTION_WEIGHT = 0.7
 DEFAULT_CONTROL_LOG_DIR = REPO_ROOT / "outputs" / "xtrainer" / "control_logs"
 _LOGGER = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class TimedAction:
-    action: np.ndarray
-    observation_timestep: int
-    timestep: int
 
 
 @dataclass(frozen=True)
@@ -134,31 +125,6 @@ def _extract_action_chunk(response: dict[str, Any], action_horizon: int) -> np.n
     return actions[:action_horizon].copy()
 
 
-def _merge_action_queue(
-    current_queue: dict[int, TimedAction],
-    result: InferenceResult,
-    *,
-    current_timestep: int,
-) -> dict[int, TimedAction]:
-    """Replace future actions with a new chunk, blending matching timesteps."""
-
-    merged: dict[int, TimedAction] = {}
-    for index, new_action in enumerate(result.actions):
-        timestep = result.observation_timestep + index
-        if timestep < current_timestep:
-            continue
-        old_action = current_queue.get(timestep)
-        action = np.asarray(new_action, dtype=np.float64).copy()
-        if old_action is not None:
-            action = OLD_ACTION_WEIGHT * old_action.action + NEW_ACTION_WEIGHT * action
-        merged[timestep] = TimedAction(
-            action=action,
-            observation_timestep=result.observation_timestep,
-            timestep=timestep,
-        )
-    return merged
-
-
 def _rate_limit_action(
     action: np.ndarray,
     last_action: np.ndarray | None,
@@ -173,24 +139,6 @@ def _rate_limit_action(
     if previous.shape != (ACTION_DIM,):
         raise ValueError(f"Expected last action shape ({ACTION_DIM},), got {previous.shape}")
     return previous + np.clip(target - previous, -max_delta_per_step, max_delta_per_step)
-
-
-def _should_prefetch(
-    queue_size: int,
-    action_horizon: int,
-    threshold: float,
-    remaining: int | None = None,
-) -> bool:
-    """Return whether to request the next chunk.
-
-    ``remaining`` is the reference repository's more explicit prefetch
-    setting.  When omitted, retain the existing fractional-threshold
-    behaviour so current launch commands do not change their timing.
-    """
-
-    if remaining is not None:
-        return queue_size <= remaining
-    return threshold > 0 and queue_size / action_horizon <= threshold
 
 
 def _crop_top_image(image: np.ndarray) -> np.ndarray:
@@ -278,14 +226,21 @@ async def run_control_loop(
     action_horizon: int,
     control_hz: float,
     max_steps: int,
-    prefetch_threshold: float,
-    prefetch_remaining: int | None = None,
     request_timeout_s: float,
     max_delta_per_step: float,
     control_log: ControlActionLog | None = None,
     monotonic_fn: Any = time.monotonic,
     sleep_fn: Any = asyncio.sleep,
 ) -> None:
+    """Execute complete policy chunks and hold while waiting for the next one.
+
+    XVLA samples an internally coherent action chunk.  Replacing actions in
+    that chunk with a newly sampled overlapping chunk made the real robot
+    switch targets mid-motion.  This runner deliberately executes each chunk
+    in order.  Once it is exhausted, it samples the real robot state, commands
+    that measured pose as a hold target, and waits for the next inference
+    result before issuing another policy action.
+    """
     initial_result = await _request_action_chunk(
         policy,
         environment.get_observation(),
@@ -294,51 +249,21 @@ async def run_control_loop(
         request_timeout_s=request_timeout_s,
         control_log=control_log,
     )
-    action_queue = _merge_action_queue({}, initial_result, current_timestep=0)
     _LOGGER.info(
         "Initial inference returned %d actions; client action horizon is %d",
         len(initial_result.actions),
         action_horizon,
     )
     last_sent_action: np.ndarray | None = None
-    pending_request: asyncio.Task[InferenceResult] | None = None
     period = 1.0 / control_hz
-    deadline = monotonic_fn()
+    result = initial_result
+    step = 0
 
-    try:
-        for step in range(max_steps):
-            if pending_request is not None and pending_request.done():
-                completed_request, pending_request = pending_request, None
-                result = completed_request.result()
-                action_queue = _merge_action_queue(action_queue, result, current_timestep=step)
-                _LOGGER.info(
-                    "Received prefetched chunk of %d actions at control step %d (queue=%d)",
-                    len(result.actions),
-                    step,
-                    len(action_queue),
-                )
-
-            timed_action = action_queue.pop(step, None)
-            used_fallback = timed_action is None
-            if timed_action is None:
-                if last_sent_action is None:
-                    raise RuntimeError(f"No action available for timestep {step}")
-                action = last_sent_action.copy()
-                if pending_request is None:
-                    _LOGGER.info("Action queue exhausted at step %d; requesting a replacement chunk", step)
-                    pending_request = asyncio.create_task(
-                        _request_action_chunk(
-                            policy,
-                            environment.get_observation(),
-                            action_horizon=action_horizon,
-                            observation_timestep=step,
-                            request_timeout_s=request_timeout_s,
-                            control_log=control_log,
-                        )
-                    )
-            else:
-                action = timed_action.action
-
+    while step < max_steps:
+        deadline = monotonic_fn()
+        for action in result.actions:
+            if step >= max_steps:
+                break
             queued_action = np.asarray(action, dtype=np.float64).copy()
             rate_limited_action = _rate_limit_action(
                 queued_action, last_sent_action, max_delta_per_step
@@ -349,49 +274,48 @@ async def run_control_loop(
                 control_log.write(
                     "control_step",
                     control_timestep=step,
-                    source_observation_timestep=(
-                        None if timed_action is None else timed_action.observation_timestep
-                    ),
-                    used_fallback=used_fallback,
+                    source_observation_timestep=result.observation_timestep,
+                    used_fallback=False,
                     queued_action=queued_action.tolist(),
                     rate_limited_action=rate_limited_action.tolist(),
                     applied_action=last_sent_action.tolist(),
                 )
-
-            if pending_request is None and _should_prefetch(
-                len(action_queue),
-                action_horizon,
-                prefetch_threshold,
-                prefetch_remaining,
-            ):
-                observation_timestep = step + 1
-                _LOGGER.info(
-                    "Requesting prefetch at control step %d (remaining actions=%d)",
-                    step,
-                    len(action_queue),
-                )
-                pending_request = asyncio.create_task(
-                    _request_action_chunk(
-                        policy,
-                        environment.get_observation(),
-                            action_horizon=action_horizon,
-                            observation_timestep=observation_timestep,
-                            request_timeout_s=request_timeout_s,
-                            control_log=control_log,
-                    )
-                )
-
+            step += 1
             deadline += period
             remaining = deadline - monotonic_fn()
             if remaining > 0:
                 await sleep_fn(remaining)
             else:
                 deadline = monotonic_fn()
-        _LOGGER.info("Reached --max-steps=%d; ending the control loop", max_steps)
-    finally:
-        if pending_request is not None:
-            pending_request.cancel()
-            await asyncio.gather(pending_request, return_exceptions=True)
+
+        if step >= max_steps:
+            break
+
+        observation = environment.get_observation()
+        hold_action = np.asarray(observation[STATE_KEY], dtype=np.float64)
+        applied_hold_action = environment.apply_action(hold_action, pace=False)
+        last_sent_action = np.asarray(applied_hold_action, dtype=np.float64).copy()
+        if control_log is not None:
+            control_log.write(
+                "control_hold",
+                control_timestep=step,
+                hold_action=hold_action.tolist(),
+                applied_action=last_sent_action.tolist(),
+            )
+        _LOGGER.info(
+            "Completed action chunk at control step %d; holding measured pose while requesting replacement",
+            step,
+        )
+        result = await _request_action_chunk(
+            policy,
+            observation,
+            action_horizon=action_horizon,
+            observation_timestep=step,
+            request_timeout_s=request_timeout_s,
+            control_log=control_log,
+        )
+
+    _LOGGER.info("Reached --max-steps=%d; ending the control loop", max_steps)
 
 
 def _validate_server_metadata(metadata: dict[str, Any], expected_domain_id: int) -> dict[str, Any]:
@@ -535,16 +459,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Minimum gripper target change to transmit; default sends every change",
     )
-    parser.add_argument("--prefetch-threshold", type=float, default=0.7)
-    parser.add_argument(
-        "--prefetch-remaining",
-        type=int,
-        default=None,
-        help=(
-            "Request the next chunk when this many actions remain (compatible with the reference "
-            "launcher; overrides --prefetch-threshold when supplied)"
-        ),
-    )
     parser.add_argument("--request-timeout", type=float, default=10.0)
     parser.add_argument(
         "--max-delta-per-step",
@@ -594,10 +508,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     invalid = [name for name, value in positive_values.items() if value <= 0]
     if invalid:
         raise ValueError(f"Expected positive values for: {', '.join(invalid)}")
-    if not 0 <= args.prefetch_threshold <= 1:
-        raise ValueError("prefetch_threshold must be in [0, 1]")
-    if args.prefetch_remaining is not None and args.prefetch_remaining < 0:
-        raise ValueError("prefetch_remaining must be non-negative")
     if not 0 <= args.domain_id < 30:
         raise ValueError("domain_id must be in [0, 30)")
     non_negative_values = {
@@ -650,8 +560,6 @@ async def run(
             action_horizon=args.action_horizon,
             control_hz=args.control_hz,
             max_steps=args.max_steps,
-            prefetch_threshold=args.prefetch_threshold,
-            prefetch_remaining=args.prefetch_remaining,
             request_timeout_s=args.request_timeout,
             max_delta_per_step=args.max_delta_per_step,
             control_log=control_log,
