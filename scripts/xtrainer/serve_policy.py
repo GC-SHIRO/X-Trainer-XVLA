@@ -1,0 +1,146 @@
+#!/usr/bin/env python
+"""Serve an XVLA checkpoint over the X-trainer WebSocket transport.
+
+Reads the deployment contract from configs/xtrainer/deploy.yaml (or an
+override) and starts XTrainerWebSocketPolicyServer with an XVLAXTrainerPolicy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from deploy.xtrainer.xvla_policy import XVLAXTrainerPolicy
+from deploy.xtrainer.websocket_policy_server import XTrainerWebSocketPolicyServer
+from deploy.xtrainer.real.constants import XTRAINER_RESET_POSE
+
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "xtrainer" / "deploy.yaml"
+DEFAULT_ACTION_LOG_DIR = REPO_ROOT / "outputs" / "xtrainer" / "action_logs"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Serve an XVLA checkpoint for X-trainer")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to deploy.yaml")
+    parser.add_argument(
+        "--checkpoint",
+        "--model-path",
+        dest="checkpoint",
+        default=None,
+        help="Override policy.checkpoint (--model-path is compatible with the reference launcher)",
+    )
+    parser.add_argument("--domain-id", type=int, default=None, help="Override policy.domain_id")
+    parser.add_argument("--device", default=None, help="Override policy.device")
+    parser.add_argument("--host", default=None, help="Override network.host")
+    parser.add_argument("--port", type=int, default=None, help="Override network.port")
+    parser.add_argument(
+        "--actions-per-chunk",
+        "--use-length",
+        dest="actions_per_chunk",
+        type=int,
+        default=None,
+        help="Actions returned per inference (the reference launcher calls this --use-length)",
+    )
+    parser.add_argument(
+        "--log-actions",
+        action="store_true",
+        help="Write every returned action chunk to a JSONL file (disabled by default)",
+    )
+    parser.add_argument(
+        "--action-log-path",
+        default=None,
+        help="JSONL destination used with --log-actions (defaults under outputs/xtrainer/action_logs/)",
+    )
+    parser.add_argument("--no-warmup", action="store_true", help="Skip the startup warmup inference")
+    return parser.parse_args(argv)
+
+
+def load_deploy_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_deploy_config(args.config)
+
+    policy_cfg = config["policy"]
+    network_cfg = config["network"]
+    xtrainer_cfg = config["xtrainer"]
+    if policy_cfg.get("type") != "xvla":
+        raise ValueError("policy.type must be 'xvla'")
+
+    checkpoint = args.checkpoint or policy_cfg["checkpoint"]
+    device = args.device or policy_cfg.get("device", "cuda")
+    domain_id = args.domain_id if args.domain_id is not None else int(policy_cfg.get("domain_id", 19))
+    if not 0 <= domain_id < 30:
+        raise ValueError("domain_id must be in [0, 30)")
+    host = args.host or network_cfg.get("host", "0.0.0.0")
+    port = args.port if args.port is not None else network_cfg.get("port", 8000)
+    actions_per_chunk = args.actions_per_chunk or policy_cfg.get(
+        "actions_per_chunk", xtrainer_cfg.get("chunk_size", 50)
+    )
+    if actions_per_chunk <= 0:
+        raise ValueError("actions_per_chunk must be positive")
+
+    action_log_path = None
+    if args.log_actions:
+        action_log_path = Path(args.action_log_path) if args.action_log_path else (
+            DEFAULT_ACTION_LOG_DIR / f"actions_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
+        )
+
+    observation_keys = xtrainer_cfg["observation_keys"]
+    camera_keys = observation_keys["images"]
+
+    policy = XVLAXTrainerPolicy(
+        checkpoint=checkpoint,
+        device=device,
+        actions_per_chunk=actions_per_chunk,
+        domain_id=domain_id,
+        camera_keys=camera_keys,
+        state_key=observation_keys.get("state", "observation.state"),
+        action_key=xtrainer_cfg.get("action_key", "action"),
+        reset_pose=list(XTRAINER_RESET_POSE),
+        warmup=not args.no_warmup,
+        action_log_path=action_log_path,
+    )
+
+    server = XTrainerWebSocketPolicyServer(
+        policy,
+        host=host,
+        port=port,
+        max_payload_bytes=int(network_cfg.get("max_payload_mb", 64)) * 1024 * 1024,
+    )
+
+    logging.info(
+        "Serving XVLA policy on %s:%d (checkpoint=%s, domain_id=%d, actions_per_chunk=%d, action_log=%s)",
+        host,
+        port,
+        checkpoint,
+        domain_id,
+        actions_per_chunk,
+        action_log_path or "disabled",
+    )
+    asyncio.run(_serve_forever(server))
+
+
+async def _serve_forever(server: XTrainerWebSocketPolicyServer) -> None:
+    await server.start()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await server.stop()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, force=True)
+    main()
