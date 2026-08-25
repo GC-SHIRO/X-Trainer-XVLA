@@ -14,6 +14,7 @@ INSTALLER = REPO_ROOT / "tools" / "install_xtrainer_env.sh"
 HF_DOWNLOADER = REPO_ROOT / "tools" / "download_xvla_weights_hf.sh"
 MODELSCOPE_DOWNLOADER = REPO_ROOT / "tools" / "download_xvla_weights_modelscope.sh"
 DEPLOY_CONFIG = REPO_ROOT / "configs" / "xtrainer" / "deploy.yaml"
+TRAIN_CONFIG = REPO_ROOT / "configs" / "xtrainer" / "train_xvla.yaml"
 
 
 def test_environment_installer_help_is_xvla_only():
@@ -31,6 +32,7 @@ def test_xvla_downloader_help_uses_official_checkpoint():
     assert result.returncode == 0
     assert "lerobot/xvla-base" in result.stdout
     assert "models/xvla-base" in result.stdout
+    assert "facebook/bart-large" in result.stdout
     assert "VLM" not in result.stdout
 
 
@@ -40,6 +42,7 @@ def test_modelscope_downloader_matches_huggingface_layout():
     assert result.returncode == 0
     assert "lerobot/xvla-base" in result.stdout
     assert "models/xvla-base" in result.stdout
+    assert "AI-ModelScope/bart-large" in result.stdout
     assert "xtrainer-xvla" in result.stdout
     assert "VLM" not in result.stdout
 
@@ -47,8 +50,10 @@ def test_modelscope_downloader_matches_huggingface_layout():
     assert '"model.safetensors"' in script
     assert '"policy_preprocessor.json"' in script
     assert '"policy_postprocessor.json"' in script
+    assert '"tokenizer.json"' in script
+    assert 'AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)' in script
     assert 'config.get("type") != "xvla"' in script
-    assert "allow_patterns" not in script
+    assert "# Download the whole remote repository." in script
     assert "whole remote repository" in script
 
 
@@ -61,6 +66,13 @@ def test_deploy_config_matches_xvla_training_contract():
     assert config["xtrainer"]["action_dim"] == 14
     assert config["xtrainer"]["state_dim"] == 14
     assert config["xtrainer"]["chunk_size"] == 32
+
+
+def test_training_config_uses_the_downloaded_offline_bart_tokenizer():
+    config = yaml.safe_load(TRAIN_CONFIG.read_text(encoding="utf-8"))
+
+    assert config["policy"]["type"] == "xvla"
+    assert config["policy"]["tokenizer_name"] == "models/xvla-base/tokenizer"
 
 
 def test_xvla_domain_id_is_validated_against_domain_table():

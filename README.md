@@ -34,6 +34,8 @@ bash tools/download_xvla_weights_hf.sh
 bash tools/download_xvla_weights_modelscope.sh
 ```
 
+两个脚本也会下载 XVLA processor 所需的 BART tokenizer 到 `models/xvla-base/tokenizer`，可在离线训练时直接使用。
+
 国内网络可指定 Hugging Face 镜像：
 
 ```bash

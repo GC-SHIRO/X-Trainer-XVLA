@@ -50,9 +50,11 @@ ModelScope 版本下载相同的 checkpoint，并保存到相同目录：
 bash tools/download_xvla_weights_modelscope.sh
 ```
 
-两个下载脚本都下载远端模型仓库的完整快照，不筛选文件；因此 `model.safetensors`、配置、processor、README 以及
-ModelScope 的 `configuration.json` 等发布文件都会保留在本地。完成后会校验 `config.json`、20 维动作头、内置
-Florence-2 配置、`model.safetensors` 和前后处理器 JSON。训练脚本统一读取 `models/xvla-base`，无需修改配置。
+两个下载脚本都下载 XVLA 远端模型仓库的完整快照，不筛选文件；因此 `model.safetensors`、配置、processor、README
+以及 ModelScope 的 `configuration.json` 等发布文件都会保留在本地。另会将 XVLA processor 需要的
+`facebook/bart-large` tokenizer（仅 tokenizer 文件，不含未使用的 BART 参数权重）写入同一目录下的
+`models/xvla-base/tokenizer`。完成后会离线加载 tokenizer 校验，因此训练时无需访问 Hugging Face。训练脚本统一
+读取 `models/xvla-base`，无需修改配置。
 
 国内镜像：
 

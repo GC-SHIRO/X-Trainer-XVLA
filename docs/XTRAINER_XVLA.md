@@ -81,7 +81,9 @@ bash tools/download_xvla_weights_modelscope.sh
 ```
 
 两个脚本均将 `lerobot/xvla-base` 的完整远端仓库快照下载到 `models/xvla-base`，不筛选模型、配置、processor 或
-仓库元数据文件；因此训练入口无需区分下载来源。国内网络也可以为 Hugging Face 指定镜像：
+仓库元数据文件；另外会把 processor 依赖的 BART tokenizer 下载到 `models/xvla-base/tokenizer`。训练配置会显式
+使用这个本地 tokenizer，因此离线或禁止 Hub 出网时也无需再下载 `facebook/bart-large`。国内网络也可以为
+Hugging Face 指定镜像：
 
 ```bash
 bash tools/download_xvla_weights_hf.sh --endpoint https://hf-mirror.com

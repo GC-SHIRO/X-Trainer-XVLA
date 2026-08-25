@@ -534,6 +534,10 @@ def train(cfg: TrainPipelineConfig):
             # Keep the saved tokenizer processor aligned with a locally overridden VLM backbone.
             preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": active_cfg.vlm_model_name}
         if active_cfg.type == "xvla":
+            # The XVLA base checkpoint references facebook/bart-large. X-trainer
+            # download tools store that tokenizer locally so training remains
+            # runnable when Hub access is disabled.
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": active_cfg.tokenizer_name}
             # A new embodiment must use the same soft-prompt domain during training and deployment.
             preprocessor_overrides["xvla_add_domain_id"] = {"domain_id": active_cfg.domain_id}
         postprocessor_overrides = {
