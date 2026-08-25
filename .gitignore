@@ -1,0 +1,49 @@
+### Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+env/
+venv/
+.python-version
+__pypackages__/
+
+### Python build and cache artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+### Training data and generated artifacts
+data/
+datasets/
+models/
+outputs/
+wandb/
+logs/
+*.log
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+### Editors, notebooks, documentation builds and OS files
+.vscode/
+.idea/
+.ipynb_checkpoints/
+docs/_build/
+.DS_Store
+Thumbs.db
+*.swp
+*~

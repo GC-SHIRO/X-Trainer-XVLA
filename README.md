@@ -28,6 +28,12 @@ conda activate xtrainer-xvla
 bash tools/download_xvla_weights_hf.sh
 ```
 
+也可以从 ModelScope 下载到完全相同的本地路径：
+
+```bash
+bash tools/download_xvla_weights_modelscope.sh
+```
+
 国内网络可指定 Hugging Face 镜像：
 
 ```bash

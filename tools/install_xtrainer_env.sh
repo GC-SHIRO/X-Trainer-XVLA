@@ -253,6 +253,7 @@ stage "X-trainer training and deployment dependencies"
 "${CONDA_PYTHON[@]}" -m pip install -e \
   "${REPO_ROOT}[training,xvla,feetech,intelrealsense]"
 "${CONDA_PYTHON[@]}" -m pip install -r "${REPO_ROOT}/deploy/xtrainer/real/requirements.txt"
+"${CONDA_PYTHON[@]}" -m pip install modelscope
 
 stage "environment validation"
 "${CONDA_PYTHON[@]}" - "${CPU_ONLY}" <<'PY'
@@ -265,6 +266,7 @@ import av
 import cv2
 import datasets
 import msgpack
+import modelscope
 import pyarrow
 import pyrealsense2
 import serial

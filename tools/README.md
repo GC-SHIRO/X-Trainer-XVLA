@@ -44,6 +44,15 @@ bash tools/download_xvla_weights_hf.sh
 
 默认保存到 `models/xvla-base`。下载中断后可直接重跑，已有文件会复用。
 
+ModelScope 版本下载相同的 checkpoint，并保存到相同目录：
+
+```bash
+bash tools/download_xvla_weights_modelscope.sh
+```
+
+ModelScope 脚本只下载与 Hugging Face 共享的 XVLA 文件，并在完成后校验 `config.json`、20 维动作头、内置
+Florence-2 配置、`model.safetensors` 和前后处理器 JSON。训练脚本统一读取 `models/xvla-base`，无需修改配置。
+
 国内镜像：
 
 ```bash
@@ -60,6 +69,15 @@ bash tools/download_xvla_weights_hf.sh \
 ```
 
 私有模型使用 `hf auth login` 或设置 `HF_TOKEN`。如果环境名不是默认值，追加 `--env-name NAME`。
+
+ModelScope 私有模型使用 `modelscope login` 或设置 `MODELSCOPE_API_TOKEN`；自定义模型、目录和 revision：
+
+```bash
+bash tools/download_xvla_weights_modelscope.sh \
+  --model-id lerobot/xvla-base \
+  --output-dir /data/models/xvla-base \
+  --revision master
+```
 
 ## 相机方向转换
 
