@@ -45,6 +45,7 @@ def test_xtrainer_training_config_parses_with_lerobot_train():
     assert raw_config["policy"]["action_mode"] == "auto"
     assert raw_config["policy"]["max_action_dim"] == 20
     assert raw_config["policy"]["domain_id"] == 19
+    assert raw_config["batch_size"] == 8
     assert raw_config["wandb"]["enable"] is True
     assert config.xtrainer["schema_version"] == 1
 

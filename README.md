@@ -190,7 +190,7 @@ policy:
 bash scripts/xtrainer/train_xvla.sh \
   --dataset-root /data/xtrainer/dataset_v21 \
   --device cuda \
-  --batch-size 4 \
+  --batch-size 8 \
   --steps 30000 \
   --output-dir outputs/train/xtrainer_xvla
 ```
