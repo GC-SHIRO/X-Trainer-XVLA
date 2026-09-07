@@ -4,6 +4,10 @@ policy:
   checkpoint: outputs/train/xtrainer_xvla/checkpoints/last/pretrained_model
   device: cuda
   actions_per_chunk: 32
+  # Soft-prompt domain. This must match the domain the checkpoint was trained on
+  # (XVLA soft prompts are domain-specific). It may be omitted here entirely:
+  # when not set, the service auto-derives it from the checkpoint's config, so the
+  # deploy YAML, service params and the checkpoint processor stay consistent.
   domain_id: 19
 
 network:

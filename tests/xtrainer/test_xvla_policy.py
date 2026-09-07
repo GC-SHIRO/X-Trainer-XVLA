@@ -68,7 +68,7 @@ class IdentityPipeline:
         return data
 
 
-def _make_policy(monkeypatch, *, fake_policy=None, load_calls=None, action_log_path=None):
+def _make_policy(monkeypatch, *, fake_policy=None, load_calls=None, action_log_path=None, domain_id=None):
     fake_policy = fake_policy or FakePolicy()
     load_calls = load_calls if load_calls is not None else []
 
@@ -91,6 +91,7 @@ def _make_policy(monkeypatch, *, fake_policy=None, load_calls=None, action_log_p
     policy = XVLAXTrainerPolicy(
         checkpoint="fake/checkpoint",
         device="cpu",
+        domain_id=domain_id,
         camera_keys=CAMERA_KEYS,
         warmup=False,
         action_log_path=action_log_path,
@@ -246,8 +247,22 @@ def test_checkpoint_domain_must_match_deployment_domain(monkeypatch):
     fake_policy = FakePolicy()
     fake_policy.config.domain_id = 18
 
-    with pytest.raises(ValueError, match="does not match"):
-        _make_policy(monkeypatch, fake_policy=fake_policy)
+    # Explicitly requesting a domain that differs from the checkpoint's trained domain
+    # is a hard error (soft prompts are domain-specific), not a silent fallback.
+    with pytest.raises(ValueError, match="does not match the checkpoint"):
+        _make_policy(monkeypatch, fake_policy=fake_policy, domain_id=19)
+
+
+def test_domain_id_auto_derives_from_checkpoint_when_omitted(monkeypatch):
+    fake_policy = FakePolicy()
+    fake_policy.config.domain_id = 18
+
+    # Without an explicit domain_id the adapter adopts the checkpoint's trained domain,
+    # so deploy YAML / service params cannot drift out of sync with the checkpoint.
+    policy, _ = _make_policy(monkeypatch, fake_policy=fake_policy)
+
+    assert policy.domain_id == 18
+    assert policy.metadata()["domain_id"] == 18
 
 
 def test_saved_processor_receives_device_and_domain_overrides(monkeypatch):

@@ -5,6 +5,13 @@ pins the X-trainer soft-prompt domain, validates observations before they reach
 the model, and exposes the ``metadata()``/``reset()``/``infer()`` contract
 expected by :class:`XTrainerWebSocketPolicyServer`.
 
+The soft-prompt ``domain_id`` is made self-consistent at load time: when
+``domain_id`` is not passed (``None``) it is auto-derived from the checkpoint's
+``config.domain_id``, so the deploy YAML / service params / checkpoint processor
+cannot drift out of sync. An explicit ``domain_id`` that conflicts with the
+checkpoint's trained domain raises an actionable error instead of silently
+using untrained soft-prompt embeddings.
+
 The service is single-client, single-batch: only one ``infer()`` call is
 handled at a time, matching the transport layer's one-request/one-response
 semantics.
@@ -39,7 +46,7 @@ class XVLAXTrainerPolicy:
         checkpoint: str,
         device: str = "cuda",
         actions_per_chunk: int = 32,
-        domain_id: int = 19,
+        domain_id: int | None = None,
         camera_keys: dict[str, str] | None = None,
         state_key: str = OBS_STATE,
         action_key: str = ACTION,
@@ -62,6 +69,7 @@ class XVLAXTrainerPolicy:
         self._action_log_file = None
 
         self.policy = self._load_policy(checkpoint, device)
+        self._resolve_domain_id()
         self._validate_policy_contract()
         self.preprocessor, self.postprocessor = self._load_processors(checkpoint)
 
@@ -76,6 +84,34 @@ class XVLAXTrainerPolicy:
         policy.eval()
         return policy
 
+    def _resolve_domain_id(self) -> None:
+        """Reconcile the requested domain_id with the checkpoint's trained domain.
+
+        XVLA's soft-prompt hub is domain-specific: each ``domain_id`` selects a separate
+        domain-aware projection and soft-prompt embedding, and only the domain(s) seen at
+        training time carry trained weights. Querying a domain the checkpoint was not trained
+        on silently degrades the policy, so the checkpoint is the authoritative source.
+
+        Compatibility semantics:
+          * ``domain_id is None`` -> adopt the checkpoint's ``config.domain_id`` (auto).
+          * explicit match        -> use the requested value.
+          * explicit conflict     -> raise with an actionable message instead of a bare
+                                    "does not match" error.
+        """
+        checkpoint_domain = int(getattr(self.policy.config, "domain_id", 0))
+        if self.domain_id is None:
+            self.domain_id = checkpoint_domain
+            logger.info("domain_id not specified; adopting checkpoint domain_id=%d", self.domain_id)
+            return
+        if self.domain_id != checkpoint_domain:
+            raise ValueError(
+                f"domain_id={self.domain_id} does not match the checkpoint's trained soft-prompt "
+                f"domain_id={checkpoint_domain}. XVLA soft-prompt weights are domain-specific: "
+                f"querying a domain the checkpoint was not trained on uses untrained embeddings "
+                f"and degrades actions. Retrain the checkpoint for that domain, set "
+                f"domain_id={checkpoint_domain}, or omit domain_id to auto-load the checkpoint's domain."
+            )
+
     def _validate_policy_contract(self) -> None:
         config = self.policy.config
         if config.action_mode.lower() != "auto":
@@ -87,11 +123,6 @@ class XVLAXTrainerPolicy:
             raise ValueError(
                 "Checkpoint is not adapted to X-trainer: "
                 f"expected real action dim {ACTION_DIM}, got {real_action_dim!r}"
-            )
-        checkpoint_domain = int(getattr(config, "domain_id", 0))
-        if checkpoint_domain != self.domain_id:
-            raise ValueError(
-                f"Checkpoint domain_id={checkpoint_domain} does not match requested domain_id={self.domain_id}"
             )
         if self.actions_per_chunk > int(config.chunk_size):
             raise ValueError(

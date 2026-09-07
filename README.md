@@ -309,17 +309,22 @@ python scripts/xtrainer/run_real.py \
 | --- | --- | --- | --- |
 | action dim | 数据集 14D | 输出校验 14D | 输入校验 14D |
 | model action dim | `max_action_dim=20` | checkpoint 内保存 | 无需感知 |
-| domain | `domain_id=19` | `domain_id=19` | metadata 校验 |
+| domain | `domain_id=19` | `domain_id=19`（可省略，自动取 checkpoint） | metadata 校验 |
 | chunk | 32 | 32 | `action_horizon=32` |
 | camera keys | top/left/right | top/left/right | top/left/right |
+
+服务的 `domain_id` 可省略：未指定时自动从 checkpoint 的 config 读取，从而与训练保持一致；显式指定且与 checkpoint 冲突时
+直接报错并给出修复建议（详见常见问题）。
 
 ## 14. 常见问题
 
 `Action dimension mismatch`：确认训练配置使用 `action_mode=auto` 和 `max_action_dim=20`，并部署微调后的 checkpoint，
 不是未经适配的基础模型。
 
-`Domain ID` 不一致：确认 YAML、服务参数和 checkpoint processor 都是 19。重新训练或切换 domain 后必须重新保存
-processor。
+`Domain ID` 不一致：XVLA 的 soft prompt 按 domain 独立训练，部署时必须与训练保持一致。服务端已做兼容：部署时
+省略 `policy.domain_id`（或 `--domain-id`）会自动取 checkpoint 里训练的 domain；显式传入与 checkpoint 不一致的
+domain 会直接报错并给出修复建议，而不是静默使用未训练的 soft prompt。切换 domain 后请重新训练/保存 checkpoint，
+确保 checkpoint 内 config 与 pre/post processor 的 `domain_id` 一致（训练时会用 `policy.domain_id` 自动写入）。
 
 图像范围错误：策略 wrapper 接收 HWC uint8，相机输入不要提前做 ImageNet normalization；XVLA processor 会统一处理。
 
