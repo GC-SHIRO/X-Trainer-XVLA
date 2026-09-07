@@ -170,7 +170,6 @@ def _flip_vertical(image: np.ndarray) -> np.ndarray:
 def _flip_horizontal(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image[:, ::-1])
 
-
 def _policy_payload(observation: dict[str, Any]) -> dict[str, Any]:
     return {
         "state": observation[STATE_KEY],

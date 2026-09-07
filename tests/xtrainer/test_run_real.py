@@ -182,6 +182,7 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.control_log_path is None
     assert math.isinf(args.max_joint_delta)
     assert math.isinf(args.max_gripper_delta)
+    assert args.max_delta_per_step == 0.0
     assert args.ramp_step == pytest.approx(0.01)
     assert args.ramp_max_steps == 100
     assert args.gripper_update_threshold == 0.0
