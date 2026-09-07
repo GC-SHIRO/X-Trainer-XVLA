@@ -173,6 +173,7 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.camera_top_serial == "409122273405"
     assert args.camera_left_wrist_serial == "412622272997"
     assert args.camera_right_wrist_serial == "412622271417"
+    assert args.camera_warmup_frames == 10
     assert args.action_horizon == 32
     assert args.control_hz == pytest.approx(30.0)
     assert args.domain_id == 19
