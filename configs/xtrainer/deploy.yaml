@@ -23,7 +23,7 @@ network:
 
 xtrainer:
   schema_version: 1
-  control_hz: 20
+  control_hz: 30
   image_size: [640, 480]
   action_dim: 14
   state_dim: 14

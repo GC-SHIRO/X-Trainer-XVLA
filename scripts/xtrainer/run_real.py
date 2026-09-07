@@ -49,7 +49,7 @@ ACTION_DIM = 14
 GRIPPER_ACTION_INDICES = (6, 13)
 BIN_GRIPPER_THRESHOLD = 0.5
 # Normalized gripper movement per control step while --bin-gripper is active.
-# At the default 20 Hz this takes one second to travel the full [1, 0] range.
+# At the default 30 Hz this takes about two thirds of a second to travel the full [1, 0] range.
 BIN_GRIPPER_CLOSE_STEP = 0.05
 DEFAULT_CONTROL_LOG_DIR = REPO_ROOT / "outputs" / "xtrainer" / "control_logs"
 _LOGGER = logging.getLogger(__name__)
@@ -423,7 +423,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", default="pick up the object")
     parser.add_argument("--domain-id", type=int, default=19, help="Expected XVLA soft-prompt domain")
     parser.add_argument("--action-horizon", type=int, default=32)
-    parser.add_argument("--control-hz", type=float, default=20.0)
+    parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument(
         "--left-robot-ip", "--left-arm-ip", dest="left_robot_ip", default="192.168.5.1"

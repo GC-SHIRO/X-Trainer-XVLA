@@ -67,6 +67,7 @@ def test_deploy_config_matches_xvla_training_contract():
     assert config["xtrainer"]["action_dim"] == 14
     assert config["xtrainer"]["state_dim"] == 14
     assert config["xtrainer"]["chunk_size"] == 32
+    assert config["xtrainer"]["control_hz"] == 30
 
     safety = config["safety"]
     assert math.isinf(safety["max_joint_delta_rad"])
