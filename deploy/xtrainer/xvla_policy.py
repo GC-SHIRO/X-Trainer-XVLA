@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -172,15 +173,26 @@ class XVLAXTrainerPolicy:
             self._action_log_file = None
 
     def infer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         self._validate_payload(payload)
         batch = self._build_batch(payload)
 
         with torch.inference_mode():
+            preprocess_started = time.perf_counter()
             transition = self.preprocessor(batch)
-            actions = self.policy.predict_action_chunk(transition)
-            actions = self.postprocessor(actions)
+            self._synchronize_device()
+            preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
 
-        actions_np = actions.squeeze(0).to(dtype=torch.float32).cpu().numpy()
+            predict_started = time.perf_counter()
+            actions = self.policy.predict_action_chunk(transition)
+            self._synchronize_device()
+            predict_ms = (time.perf_counter() - predict_started) * 1000.0
+
+            postprocess_started = time.perf_counter()
+            actions = self.postprocessor(actions)
+            actions_np = actions.squeeze(0).to(dtype=torch.float32).cpu().numpy()
+            postprocess_ms = (time.perf_counter() - postprocess_started) * 1000.0
+
         actions_np = actions_np[: self.actions_per_chunk]
 
         if not np.isfinite(actions_np).all():
@@ -189,7 +201,21 @@ class XVLAXTrainerPolicy:
             raise ValueError(f"policy produced action dim {actions_np.shape[-1]}, expected {ACTION_DIM}")
 
         self._record_actions(actions_np, payload["images"])
+        total_ms = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "Inference timing: total=%.1fms preprocess=%.1fms predict=%.1fms postprocess=%.1fms actions=%d",
+            total_ms,
+            preprocess_ms,
+            predict_ms,
+            postprocess_ms,
+            actions_np.shape[0],
+        )
         return {self.action_key: actions_np.astype(np.float32)}
+
+    def _synchronize_device(self) -> None:
+        """Flush pending CUDA work so measured segments reflect GPU time."""
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize(self.device)
 
     def _open_action_log(self) -> None:
         assert self._action_log_path is not None

@@ -118,6 +118,22 @@ def test_infer_returns_expected_action_shape(monkeypatch):
     assert np.isfinite(result["action"]).all()
 
 
+def test_infer_logs_timing_breakdown(monkeypatch, caplog):
+    policy, fake_policy = _make_policy(monkeypatch)
+
+    with caplog.at_level("INFO", logger="deploy.xtrainer.xvla_policy"):
+        policy.infer(_valid_payload())
+
+    timing_records = [record for record in caplog.records if "Inference timing" in record.getMessage()]
+    assert len(timing_records) == 1
+    message = timing_records[0].getMessage()
+    assert "total=" in message
+    assert "preprocess=" in message
+    assert "predict=" in message
+    assert "postprocess=" in message
+    assert f"actions={fake_policy.chunk_len}" in message
+
+
 def test_infer_truncates_to_actions_per_chunk(monkeypatch):
     policy, _ = _make_policy(monkeypatch)
     policy.actions_per_chunk = 3
