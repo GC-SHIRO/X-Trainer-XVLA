@@ -455,6 +455,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-warmup-frames", type=int, default=10)
     parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG quality for camera transport; set to 0 to send raw RGB arrays",
+    )
+    parser.add_argument(
         "--max-joint-delta",
         type=float,
         default=float("inf"),
@@ -543,8 +549,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"Expected positive values for: {', '.join(invalid)}")
     if not 0 <= args.domain_id < 30:
         raise ValueError("domain_id must be in [0, 30)")
+    if args.image_jpeg_quality > 100:
+        raise ValueError("image_jpeg_quality must be in [0, 100]")
     non_negative_values = {
         "camera_warmup_frames": args.camera_warmup_frames,
+        "image_jpeg_quality": args.image_jpeg_quality,
         "max_joint_delta": args.max_joint_delta,
         "max_gripper_delta": args.max_gripper_delta,
         "ramp_step": args.ramp_step,
@@ -569,7 +578,9 @@ async def run(
     if args.observation_similarity_epsilon is not None:
         _LOGGER.warning("--observation-similarity-epsilon is reserved and has no effect in this version")
 
-    policy = policy or XTrainerWebSocketPolicyClient(f"http://{args.host}:{args.port}")
+    policy = policy or XTrainerWebSocketPolicyClient(
+        f"http://{args.host}:{args.port}", image_jpeg_quality=args.image_jpeg_quality
+    )
     active_environment = environment
     control_log = None
     if args.log_control:

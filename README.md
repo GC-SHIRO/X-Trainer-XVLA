@@ -283,6 +283,7 @@ python scripts/xtrainer/run_real.py \
   --domain-id 19 \
   --action-horizon 32 \
   --control-hz 30 \
+  --image-jpeg-quality 85 \
   --max-joint-delta 0.05 \
   --max-gripper-delta 0.03 \
   --max-steps 1000 \
@@ -292,6 +293,9 @@ python scripts/xtrainer/run_real.py \
 客户端完整执行每个策略返回的动作 chunk，不在 chunk 中途预取或混合新旧动作。chunk 结束后，客户端读取
 当前真实状态并将其作为 hold 目标下发；在等待下一次推理结果期间不执行任何新的策略动作。最终动作仍经过
 可选速率限制与环境安全限幅。
+
+客户端默认以质量 85 的 JPEG 压缩三路 RGB 图像后传输，服务端解码回原始尺寸的 RGB 数组再进入模型。
+服务端不支持 JPEG 时客户端自动回退为原始数组；可用 `--image-jpeg-quality 0` 主动关闭压缩。
 
 第一次上机建议：
 

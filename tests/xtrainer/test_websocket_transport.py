@@ -10,6 +10,7 @@ from deploy.xtrainer import (
     dumps as public_dumps,
     loads as public_loads,
 )
+from deploy.xtrainer.image_codec import decode_policy_images, encode_policy_images
 from deploy.xtrainer.msgpack_numpy import ProtocolError, dumps, loads
 from deploy.xtrainer.websocket_client_policy import XTrainerWebSocketPolicyClient
 from deploy.xtrainer.websocket_policy_server import XTrainerWebSocketPolicyServer
@@ -20,6 +21,7 @@ pytest.importorskip("aiohttp")
 class EchoPolicy:
     def __init__(self):
         self.reset_count = 0
+        self.last_payload = None
 
     def metadata(self):
         return {
@@ -33,6 +35,7 @@ class EchoPolicy:
         self.reset_count += 1
 
     def infer(self, payload):
+        self.last_payload = payload
         return {"action": payload["state"].astype(np.float32) + 1.0}
 
 
@@ -56,6 +59,22 @@ def test_numpy_msgpack_roundtrip_preserves_dtype_and_shape():
     assert decoded["state"].shape == (14,)
     assert decoded["image"].dtype == np.uint8
     assert decoded["image"].shape == (2, 3, 4)
+
+
+def test_jpeg_policy_images_reduce_payload_and_preserve_rgb_channels():
+    image = np.zeros((64, 96, 3), dtype=np.uint8)
+    image[..., 0] = 220
+    image[..., 1] = 80
+    image[..., 2] = 20
+    payload = {"images": {"top": image}}
+
+    encoded = encode_policy_images(payload, quality=85)
+    decoded = decode_policy_images(loads(dumps(encoded)))
+
+    assert len(dumps(encoded)) < len(dumps(payload)) / 4
+    assert decoded["images"]["top"].shape == image.shape
+    assert decoded["images"]["top"].dtype == np.uint8
+    np.testing.assert_allclose(decoded["images"]["top"].mean(axis=(0, 1)), [220, 80, 20], atol=3)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +106,7 @@ def test_websocket_health_metadata_and_infer_roundtrip():
 
 async def _websocket_health_metadata_and_infer_roundtrip():
     server = XTrainerWebSocketPolicyServer(EchoPolicy(), port=0)
+    image = np.full((32, 48, 3), [220, 80, 20], dtype=np.uint8)
     await server.start()
     try:
         client = XTrainerWebSocketPolicyClient(f"http://127.0.0.1:{server.port}")
@@ -94,7 +114,9 @@ async def _websocket_health_metadata_and_infer_roundtrip():
         try:
             health = await client.get_healthz()
             remote_metadata = await client.get_metadata()
-            result = await client.infer({"state": np.arange(14, dtype=np.float32)})
+            result = await client.infer(
+                {"state": np.arange(14, dtype=np.float32), "images": {"top": image}}
+            )
             await client.reset()
         finally:
             await client.close()
@@ -106,6 +128,10 @@ async def _websocket_health_metadata_and_infer_roundtrip():
     assert metadata["trusted_lan_only"] is True
     assert remote_metadata["policy"]["action_dim"] == 14
     np.testing.assert_array_equal(result["action"], np.arange(14, dtype=np.float32) + 1.0)
+    assert server.policy.last_payload["images"]["top"].shape == image.shape
+    np.testing.assert_allclose(
+        server.policy.last_payload["images"]["top"].mean(axis=(0, 1)), [220, 80, 20], atol=3
+    )
     assert server.policy.reset_count == 1
 
 

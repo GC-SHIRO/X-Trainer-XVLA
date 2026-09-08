@@ -174,6 +174,7 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.camera_left_wrist_serial == "412622272997"
     assert args.camera_right_wrist_serial == "412622271417"
     assert args.camera_warmup_frames == 10
+    assert args.image_jpeg_quality == 85
     assert args.action_horizon == 32
     assert args.control_hz == pytest.approx(30.0)
     assert args.domain_id == 19
@@ -197,6 +198,19 @@ def test_cli_accepts_optional_client_control_log_path(tmp_path):
 
     assert args.log_control is True
     assert args.control_log_path == log_path
+
+
+def test_cli_can_disable_jpeg_image_transport():
+    args = parse_args(["--host", "127.0.0.1", "--image-jpeg-quality", "0"])
+
+    assert args.image_jpeg_quality == 0
+
+
+def test_cli_rejects_invalid_jpeg_quality():
+    args = parse_args(["--host", "127.0.0.1", "--image-jpeg-quality", "101"])
+
+    with pytest.raises(ValueError, match="image_jpeg_quality"):
+        asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))
 
 
 def test_cli_accepts_reference_hardware_option_names():

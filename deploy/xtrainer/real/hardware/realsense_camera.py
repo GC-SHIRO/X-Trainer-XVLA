@@ -88,7 +88,7 @@ class XTrainerRealSenseCamera:
     def read_rgb(self) -> np.ndarray:
         if self._camera is None:
             raise ConnectionError("RealSense camera is not connected")
-        image = np.asarray(self._camera.read())
+        image = np.asarray(self._camera.read_latest(max_age_ms=100))
         if image.ndim != 3 or image.shape[2] != 3:
             raise RuntimeError(f"RealSense RGB frame must be HxWx3, got {image.shape}")
         if image.dtype != np.uint8:
