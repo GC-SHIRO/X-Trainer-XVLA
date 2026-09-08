@@ -17,6 +17,7 @@ from deploy.xtrainer.real.environment import (
 from scripts.xtrainer.run_real import (
     ControlActionLog,
     _apply_binary_gripper_close,
+    _blend_chunk_action,
     _extract_action_chunk,
     _policy_payload,
     _rate_limit_action,
@@ -167,6 +168,22 @@ def test_bin_gripper_smoothly_closes_values_below_threshold():
     assert transformed[0] == pytest.approx(0.8)
 
 
+def test_chunk_blend_rejoins_trajectory_without_changing_grippers():
+    anchor = np.full(14, 0.2)
+    targets = np.full((8, 14), 0.8)
+    targets[:, 0] += np.arange(8) * 0.01
+    actual = np.array([_blend_chunk_action(a, anchor, i, 6) for i, a in enumerate(targets)])
+
+    assert actual[0, 0] == pytest.approx(0.2 + 0.6 * (2 / 27))
+    assert np.all(np.diff(actual[:6, 0]) > 0)
+    np.testing.assert_array_equal(actual[:, [6, 13]], targets[:, [6, 13]])
+    np.testing.assert_array_equal(actual[5:], targets[5:])
+    np.testing.assert_array_equal(anchor, np.full(14, 0.2))
+    for steps in (0, 1):
+        np.testing.assert_array_equal(_blend_chunk_action(targets[0], anchor, 0, steps), targets[0])
+    np.testing.assert_array_equal(_blend_chunk_action(targets[0], None, 0, 6), targets[0])
+
+
 def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     args = parse_args(["--host", "127.0.0.1"])
 
@@ -186,6 +203,7 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert math.isinf(args.max_joint_delta)
     assert math.isinf(args.max_gripper_delta)
     assert args.max_delta_per_step == 0.0
+    assert args.chunk_blend_steps == 6
     assert args.ramp_step == pytest.approx(0.01)
     assert args.ramp_max_steps == 100
     assert args.gripper_update_threshold == 0.0
@@ -255,6 +273,7 @@ def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
             max_steps=5,
             request_timeout_s=1.0,
             max_delta_per_step=0.0,
+            chunk_blend_steps=0,
             monotonic_fn=lambda: 0.0,
             sleep_fn=yield_control,
         )
@@ -269,6 +288,49 @@ def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
     assert policy.max_active_infers == 1
     assert set(policy.payloads[0]) == {"state", "images", "task"}
     assert set(policy.payloads[0]["images"]) == {"top", "left_wrist", "right_wrist"}
+
+
+def test_control_loop_blends_from_applied_hold_without_extra_steps(tmp_path):
+    class LimitedHoldEnvironment(MockEnvironment):
+        def apply_action(self, action, *, pace=True):
+            # 模拟 hold 经环境处理后与请求值不同，过渡必须从实际下发值起步。
+            if len(self.actions) == 4:
+                action = np.full(14, 0.2)
+            return super().apply_action(action, pace=pace)
+
+    async def exercise():
+        environment = LimitedHoldEnvironment()
+        policy = MockPolicy([np.full((4, 14), 0.1), np.full((4, 14), 0.8)])
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+
+        log = ControlActionLog(tmp_path / "blend.jsonl")
+        try:
+            await run_control_loop(
+                policy, environment, action_horizon=4, control_hz=30, max_steps=8,
+                request_timeout_s=1, max_delta_per_step=0, chunk_blend_steps=6,
+                control_log=log, monotonic_fn=lambda: 0, sleep_fn=sleep,
+            )
+        finally:
+            log.close()
+        assert len(sleeps) == 8
+        assert policy.infer_calls == 2
+        assert policy.max_active_infers == 1
+        return environment.actions
+
+    actions = np.array(asyncio.run(exercise()))
+    assert len(actions) == 9
+    np.testing.assert_allclose(actions[:4], 0.1)
+    np.testing.assert_allclose(actions[4], 0.2)
+    assert actions[5, 0] == pytest.approx(0.2 + 0.6 * 0.15625)
+    np.testing.assert_allclose(actions[5:, [6, 13]], 0.8)
+    np.testing.assert_allclose(actions[-1], 0.8)
+    records = [json.loads(line) for line in (tmp_path / "blend.jsonl").read_text().splitlines()]
+    steps = [r for r in records if r['event'] == 'control_step']
+    assert steps[4]['queued_action'][0] == 0.8
+    assert steps[4]['blended_action'][0] == pytest.approx(actions[5, 0])
 
 
 def test_control_loop_records_hold_without_fallback(tmp_path):
