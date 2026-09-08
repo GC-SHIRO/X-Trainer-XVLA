@@ -11,6 +11,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .image_codec import decode_policy_images
 from .msgpack_numpy import ProtocolError, dumps, loads, protocol_metadata
 
 PolicyInfer = Callable[[dict[str, Any]], dict[str, Any] | Awaitable[dict[str, Any]]]
@@ -121,6 +122,7 @@ class XTrainerWebSocketPolicyServer:
             payload = request.get("payload")
             if not isinstance(payload, dict):
                 raise ProtocolError("infer request requires a payload map")
+            payload = decode_policy_images(payload)
             infer = getattr(self.policy, "infer", None)
             if not callable(infer):
                 raise ProtocolError("policy does not implement infer(payload)")

@@ -9,7 +9,10 @@ from deploy.xtrainer.real.environment import (
     XTrainerRealEnvironment,
     XTrainerSafetyConfig,
 )
-from deploy.xtrainer.real.hardware.realsense_camera import XTrainerRealSenseCameraConfig
+from deploy.xtrainer.real.hardware.realsense_camera import (
+    XTrainerRealSenseCamera,
+    XTrainerRealSenseCameraConfig,
+)
 
 
 class MockArm:
@@ -82,6 +85,38 @@ class MockCamera:
 class BadShapeCamera(MockCamera):
     def read_rgb(self):
         return np.zeros((4, 5), dtype=np.uint8)
+
+
+class MockSdkCamera:
+    def __init__(self, _config):
+        self.latest_max_age_ms = None
+
+    def connect(self):
+        pass
+
+    def read_latest(self, *, max_age_ms):
+        self.latest_max_age_ms = max_age_ms
+        return np.zeros((4, 5, 3), dtype=np.uint8)
+
+
+def test_realsense_wrapper_reads_latest_buffered_frame():
+    config = XTrainerRealSenseCameraConfig(
+        name="top",
+        serial="top-serial",
+        observation_key="observation.images.top",
+        warmup_frames=0,
+    )
+    camera = XTrainerRealSenseCamera(
+        config,
+        camera_factory=MockSdkCamera,
+        camera_config_factory=lambda **kwargs: kwargs,
+    )
+    camera.connect()
+
+    image = camera.read_rgb()
+
+    assert image.shape == (4, 5, 3)
+    assert camera._camera.latest_max_age_ms == 100
 
 
 def make_env(**kwargs):
@@ -283,17 +318,18 @@ def test_close_failure_does_not_skip_other_resource_cleanup():
     assert env.right_gripper.closed
 
 
-def test_smooth_reset_steps_with_control_period():
+def test_smooth_reset_matches_lingbot_interpolation_without_control_period():
     sleeps = []
     env = make_env(sleep_fn=sleeps.append, safety=XTrainerSafetyConfig(ramp_step_rad=0.5, ramp_max_steps=20))
     env.reset()
     target = np.zeros(14, dtype=np.float32)
     target[0] = 2.0
 
-    env.smooth_reset(target)
+    applied = env.smooth_reset(target)
 
-    assert len(env.left_arm.commands) > 1
-    assert all(seconds == pytest.approx(1 / 20) for seconds in sleeps)
+    assert len(env.left_arm.commands) == 20
+    np.testing.assert_allclose(applied, target)
+    assert sleeps == []
 
 
 def test_apply_action_can_defer_pacing_to_external_control_loop():

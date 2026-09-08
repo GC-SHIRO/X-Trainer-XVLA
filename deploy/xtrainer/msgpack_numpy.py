@@ -140,6 +140,7 @@ def protocol_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "transport": "websocket",
         "encoding": "messagepack-numpy",
+        "image_encodings": ["raw_ndarray", "jpeg_rgb"],
         "trusted_lan_only": True,
         "auth": "none",
         "tls": "none",

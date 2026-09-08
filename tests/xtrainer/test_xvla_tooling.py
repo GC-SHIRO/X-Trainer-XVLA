@@ -1,5 +1,6 @@
 """Contracts for the XVLA-only environment, model download, and deployment files."""
 
+import math
 import subprocess
 from pathlib import Path
 
@@ -66,6 +67,14 @@ def test_deploy_config_matches_xvla_training_contract():
     assert config["xtrainer"]["action_dim"] == 14
     assert config["xtrainer"]["state_dim"] == 14
     assert config["xtrainer"]["chunk_size"] == 32
+    assert config["xtrainer"]["control_hz"] == 30
+
+    safety = config["safety"]
+    assert math.isinf(safety["max_joint_delta_rad"])
+    assert math.isinf(safety["max_gripper_delta"])
+    assert safety["max_delta_per_step_rad"] == 0.0
+    assert safety["gripper_update_threshold"] == 0.0
+    assert safety["joint_position_limit_rad"] == [-math.inf, math.inf]
 
 
 def test_training_config_uses_the_downloaded_offline_bart_tokenizer():

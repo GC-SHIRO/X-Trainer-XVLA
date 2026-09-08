@@ -5,6 +5,9 @@ from scripts.xtrainer.check_real_hardware import _move_gripper, _validate_args, 
 
 
 def test_hardware_check_requires_explicit_motion_confirmation():
+    assert parse_args([]).control_hz == pytest.approx(30.0)
+    assert parse_args([]).camera_warmup_frames == 10
+
     with pytest.raises(RuntimeError, match="pass --execute"):
         _validate_args(parse_args([]))
 

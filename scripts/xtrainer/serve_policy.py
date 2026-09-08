@@ -81,8 +81,16 @@ def main() -> None:
 
     checkpoint = args.checkpoint or policy_cfg["checkpoint"]
     device = args.device or policy_cfg.get("device", "cuda")
-    domain_id = args.domain_id if args.domain_id is not None else int(policy_cfg.get("domain_id", 19))
-    if not 0 <= domain_id < 30:
+    # domain_id is optional: when omitted, XVLAXTrainerPolicy auto-derives it from the
+    # checkpoint's config (the trained soft-prompt domain), so YAML / service params /
+    # checkpoint processor cannot drift out of sync. Only validate an explicit value.
+    if args.domain_id is not None:
+        domain_id = args.domain_id
+    elif "domain_id" in policy_cfg:
+        domain_id = int(policy_cfg["domain_id"])
+    else:
+        domain_id = None
+    if domain_id is not None and not 0 <= domain_id < 30:
         raise ValueError("domain_id must be in [0, 30)")
     host = args.host or network_cfg.get("host", "0.0.0.0")
     port = args.port if args.port is not None else network_cfg.get("port", 8000)
@@ -126,7 +134,7 @@ def main() -> None:
         host,
         port,
         checkpoint,
-        domain_id,
+        policy.domain_id,
         actions_per_chunk,
         action_log_path or "disabled",
     )

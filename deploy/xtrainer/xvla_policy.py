@@ -5,6 +5,13 @@ pins the X-trainer soft-prompt domain, validates observations before they reach
 the model, and exposes the ``metadata()``/``reset()``/``infer()`` contract
 expected by :class:`XTrainerWebSocketPolicyServer`.
 
+The soft-prompt ``domain_id`` is made self-consistent at load time: when
+``domain_id`` is not passed (``None``) it is auto-derived from the checkpoint's
+``config.domain_id``, so the deploy YAML / service params / checkpoint processor
+cannot drift out of sync. An explicit ``domain_id`` that conflicts with the
+checkpoint's trained domain raises an actionable error instead of silently
+using untrained soft-prompt embeddings.
+
 The service is single-client, single-batch: only one ``infer()`` call is
 handled at a time, matching the transport layer's one-request/one-response
 semantics.
@@ -14,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +47,7 @@ class XVLAXTrainerPolicy:
         checkpoint: str,
         device: str = "cuda",
         actions_per_chunk: int = 32,
-        domain_id: int = 19,
+        domain_id: int | None = None,
         camera_keys: dict[str, str] | None = None,
         state_key: str = OBS_STATE,
         action_key: str = ACTION,
@@ -62,6 +70,7 @@ class XVLAXTrainerPolicy:
         self._action_log_file = None
 
         self.policy = self._load_policy(checkpoint, device)
+        self._resolve_domain_id()
         self._validate_policy_contract()
         self.preprocessor, self.postprocessor = self._load_processors(checkpoint)
 
@@ -76,6 +85,34 @@ class XVLAXTrainerPolicy:
         policy.eval()
         return policy
 
+    def _resolve_domain_id(self) -> None:
+        """Reconcile the requested domain_id with the checkpoint's trained domain.
+
+        XVLA's soft-prompt hub is domain-specific: each ``domain_id`` selects a separate
+        domain-aware projection and soft-prompt embedding, and only the domain(s) seen at
+        training time carry trained weights. Querying a domain the checkpoint was not trained
+        on silently degrades the policy, so the checkpoint is the authoritative source.
+
+        Compatibility semantics:
+          * ``domain_id is None`` -> adopt the checkpoint's ``config.domain_id`` (auto).
+          * explicit match        -> use the requested value.
+          * explicit conflict     -> raise with an actionable message instead of a bare
+                                    "does not match" error.
+        """
+        checkpoint_domain = int(getattr(self.policy.config, "domain_id", 0))
+        if self.domain_id is None:
+            self.domain_id = checkpoint_domain
+            logger.info("domain_id not specified; adopting checkpoint domain_id=%d", self.domain_id)
+            return
+        if self.domain_id != checkpoint_domain:
+            raise ValueError(
+                f"domain_id={self.domain_id} does not match the checkpoint's trained soft-prompt "
+                f"domain_id={checkpoint_domain}. XVLA soft-prompt weights are domain-specific: "
+                f"querying a domain the checkpoint was not trained on uses untrained embeddings "
+                f"and degrades actions. Retrain the checkpoint for that domain, set "
+                f"domain_id={checkpoint_domain}, or omit domain_id to auto-load the checkpoint's domain."
+            )
+
     def _validate_policy_contract(self) -> None:
         config = self.policy.config
         if config.action_mode.lower() != "auto":
@@ -87,11 +124,6 @@ class XVLAXTrainerPolicy:
             raise ValueError(
                 "Checkpoint is not adapted to X-trainer: "
                 f"expected real action dim {ACTION_DIM}, got {real_action_dim!r}"
-            )
-        checkpoint_domain = int(getattr(config, "domain_id", 0))
-        if checkpoint_domain != self.domain_id:
-            raise ValueError(
-                f"Checkpoint domain_id={checkpoint_domain} does not match requested domain_id={self.domain_id}"
             )
         if self.actions_per_chunk > int(config.chunk_size):
             raise ValueError(
@@ -141,15 +173,26 @@ class XVLAXTrainerPolicy:
             self._action_log_file = None
 
     def infer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         self._validate_payload(payload)
         batch = self._build_batch(payload)
 
         with torch.inference_mode():
+            preprocess_started = time.perf_counter()
             transition = self.preprocessor(batch)
-            actions = self.policy.predict_action_chunk(transition)
-            actions = self.postprocessor(actions)
+            self._synchronize_device()
+            preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
 
-        actions_np = actions.squeeze(0).to(dtype=torch.float32).cpu().numpy()
+            predict_started = time.perf_counter()
+            actions = self.policy.predict_action_chunk(transition)
+            self._synchronize_device()
+            predict_ms = (time.perf_counter() - predict_started) * 1000.0
+
+            postprocess_started = time.perf_counter()
+            actions = self.postprocessor(actions)
+            actions_np = actions.squeeze(0).to(dtype=torch.float32).cpu().numpy()
+            postprocess_ms = (time.perf_counter() - postprocess_started) * 1000.0
+
         actions_np = actions_np[: self.actions_per_chunk]
 
         if not np.isfinite(actions_np).all():
@@ -158,7 +201,21 @@ class XVLAXTrainerPolicy:
             raise ValueError(f"policy produced action dim {actions_np.shape[-1]}, expected {ACTION_DIM}")
 
         self._record_actions(actions_np, payload["images"])
+        total_ms = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "Inference timing: total=%.1fms preprocess=%.1fms predict=%.1fms postprocess=%.1fms actions=%d",
+            total_ms,
+            preprocess_ms,
+            predict_ms,
+            postprocess_ms,
+            actions_np.shape[0],
+        )
         return {self.action_key: actions_np.astype(np.float32)}
+
+    def _synchronize_device(self) -> None:
+        """Flush pending CUDA work so measured segments reflect GPU time."""
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize(self.device)
 
     def _open_action_log(self) -> None:
         assert self._action_log_path is not None

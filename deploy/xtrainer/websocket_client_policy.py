@@ -4,15 +4,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from .image_codec import JPEG_RGB_ENCODING, encode_policy_images
 from .msgpack_numpy import PROTOCOL_VERSION, ProtocolError, dumps, loads
 
 
 class XTrainerWebSocketPolicyClient:
     """Small one-request/one-response client for X-trainer policy servers."""
 
-    def __init__(self, base_url: str, *, max_payload_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        max_payload_bytes: int | None = None,
+        image_jpeg_quality: int = 85,
+    ) -> None:
+        if not 0 <= image_jpeg_quality <= 100:
+            raise ValueError("image_jpeg_quality must be in [0, 100]")
         self.base_url = base_url.rstrip("/")
         self.max_payload_bytes = max_payload_bytes
+        self.image_jpeg_quality = image_jpeg_quality
         self._session = None
         self._ws = None
         self.metadata: dict[str, Any] | None = None
@@ -83,6 +93,9 @@ class XTrainerWebSocketPolicyClient:
         return await self.request({"type": "reset"})
 
     async def infer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        image_encodings = self.metadata.get("image_encodings", []) if self.metadata is not None else []
+        if self.image_jpeg_quality > 0 and JPEG_RGB_ENCODING in image_encodings:
+            payload = encode_policy_images(payload, self.image_jpeg_quality)
         response = await self.request({"type": "infer", "payload": payload})
         result = response.get("payload")
         if not isinstance(result, dict):
