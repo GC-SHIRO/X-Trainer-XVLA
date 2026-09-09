@@ -275,6 +275,25 @@ python tools/transform_xtrainer_dataset_images.py \
   --overwrite-output
 ```
 
+### 7.4 如何理解转换
+
+采集程序生成的是便于机器人实时写入的 raw 数据，而训练程序需要的是 LeRobot Dataset v2.1。转换脚本的作用可以理解为“整理和打包”，不会改变任务本身：
+
+
+因此，转换前后的 episode 数量通常应该一致。转换成功并不代表数据一定适合训练，还需要执行第 9 节的数据校验，并抽查图片和动作是否对应。
+
+### 7.5 参数怎么选
+
+- `--raw-root` 是采集结果所在目录，下面应直接包含多个 episode 子目录；不要填写某一个 episode 的路径。
+- `--output-root` 是新数据集目录。建议使用一个不存在的目录，或确认 `--overwrite-output` 不会覆盖仍需保留的数据。
+- `--task` 是这批 episode 的任务描述。训练和真机执行时应使用相同或含义一致的文字，避免只改写同一任务的说法。
+- `--fps` 应与采集时的实际帧率接近。帧率过高会让视频播放过快，过低会让动作和图像的时间关系变差。
+- `--use-videos` 会生成视频并减少大量小图片文件，通常适合正式训练；调试单个样本时也可以先不使用它以便直接查看图片。
+- `--fail-on-bad-frames` 会在遇到坏帧时立即停止，适合数据质量要求较高的正式转换；不加此参数时应在转换日志中确认是否跳过了坏帧。
+
+
+
+
 ## 8. 模型数据配置
 
 XVLA 读取以下字段，不要改成其他相机名称：
@@ -300,6 +319,8 @@ policy:
 ```
 
 数据集标签仍是 14 维，XVLA 内部负责补零、计算损失和裁剪输出。
+
+
 
 ## 9. 基础模型与数据校验
 
@@ -329,6 +350,8 @@ python scripts/xtrainer/validate_dataset_v21.py \
   --all-episodes
 ```
 
+
+
 ## 10. XVLA 全量微调
 
 ### 10.1 Smoke training
@@ -357,6 +380,8 @@ bash scripts/xtrainer/train_xvla.sh \
 
 显存不足时先减小 batch size，再根据训练配置调整冻结项。保持 `action_mode: auto`、`max_action_dim: 20` 和 `domain_id: 19` 不变。训练输出的 `pretrained_model` 目录用于策略服务。
 
+先完成一次 Smoke training，只用来验证环境、模型和数据管线可以运行，并不代表模型已经学会任务。确认成功后再增加训练步数，并观察显存占用和 loss 是否正常。
+
 ## 11. 断点续训
 
 ```bash
@@ -370,6 +395,9 @@ bash scripts/xtrainer/train_xvla.sh \
 ```
 
 断点续训时，checkpoint 中保存的模型、processor 和 domain ID 为准。数据根目录、输出目录、设备、batch size 和总步数可按任务调整。
+
+
+续训时选择上一次训练生成的 `last/pretrained_model`。如果更换了数据集或任务，应重新确认训练结果是否仍然具有可比性。
 
 ## 12. 启动策略服务
 
@@ -396,6 +424,7 @@ python scripts/xtrainer/serve_policy.py \
 | 可选 | `--no-warmup` | 关闭 | 跳过服务启动时的首次 warmup 推理，主要用于排查模型加载问题；正常部署建议保留 warmup。 |
 
 服务端和机器人控制机应位于可信局域网，监听地址和客户端目标 IP 必须对应。
+
 
 ## 13. 启动真机任务
 
@@ -438,6 +467,8 @@ python scripts/xtrainer/run_real.py \
 | 可选 | `--log-control` | 关闭 | 将状态、模型动作和最终下发动作写入客户端 JSONL 日志。日志不保存图像，通常不会显著影响控制速度。 |
 | 可选 | `--control-log-path` | `outputs/xtrainer/control_logs/control_<UTC>.jsonl` | 自定义 `--log-control` 的日志路径；仅在启用 `--log-control` 时生效。 |
 
+
+
 ## 14. 关键文件索引
 
 ```text
@@ -451,3 +482,5 @@ scripts/xtrainer/run_real.py
 configs/xtrainer/train_xvla.yaml
 configs/xtrainer/deploy.yaml
 ```
+
+
