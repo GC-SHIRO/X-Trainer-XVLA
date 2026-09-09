@@ -380,19 +380,20 @@ python scripts/xtrainer/serve_policy.py \
   --actions-per-chunk 32 
 ```
 
-`domain_id` 必须与 checkpoint 训练时使用的 domain 一致。若命令行和部署 YAML 都不指定该值，服务会自动读取 checkpoint 中的 `domain_id`；若显式指定的值与 checkpoint 冲突，服务会直接报错，避免使用未训练的 domain。
+`serve_policy.py` 的命令行参数均为可选覆盖项；未指定时从 `configs/xtrainer/deploy.yaml` 读取。checkpoint 和 domain 虽然已有配置默认值，但启动前必须确认。
 
-此外，可以通过传入 `--log-actions` 参数来保存 log 记录。但是由于会保存中间过程图片，会严重影响推理速度，仅用于debug使用
-
-服务通过 WebSocket + MessagePack 与客户端通信。metadata 应声明：
-
-```text
-model_type=xvla
-action_dim=14
-state_dim=14
-chunk_size=32
-domain_id=19
-```
+| 类型 | 参数 | 默认值或来源 | 作用和注意事项 |
+|---|---|---|---|
+| 配置必查 | `--checkpoint` / `--model-path` | `policy.checkpoint` | 要部署的 `pretrained_model` 目录；两个参数名等价。必须使用完成 X-Trainer 微调后的 checkpoint。 |
+| 配置必查 | `--domain-id` | `policy.domain_id` | 覆盖 XVLA domain，必须与 checkpoint 训练时的 domain 一致。命令行和 YAML 都不指定时自动读取 checkpoint；显式冲突时直接报错。 |
+| 可选 | `--config` | `configs/xtrainer/deploy.yaml` | 部署配置文件路径。 |
+| 可选 | `--device` | `policy.device`，当前为 `cuda` | 模型加载和推理设备。 |
+| 可选 | `--host` | `network.host`，当前为 `0.0.0.0` | 服务监听地址。`0.0.0.0` 表示监听本机所有网络接口。 |
+| 可选 | `--port` | `network.port`，当前为 `8000` | 服务监听端口，必须与 `run_real.py --port` 一致。 |
+| 可选 | `--actions-per-chunk` / `--use-length` | `policy.actions_per_chunk`，当前为 `32` | 每次推理返回的动作步数；两个参数名等价，且不能超过 checkpoint 的 `chunk_size`。 |
+| 可选 | `--log-actions` | 关闭 | 将每次返回的动作块和输入图像写入 JSONL。图像数据会使文件快速增大并影响推理速度，仅建议短时调试。 |
+| 可选 | `--action-log-path` | `outputs/xtrainer/action_logs/actions_<UTC>.jsonl` | 自定义动作日志路径；仅在启用 `--log-actions` 时生效。 |
+| 可选 | `--no-warmup` | 关闭 | 跳过服务启动时的首次 warmup 推理，主要用于排查模型加载问题；正常部署建议保留 warmup。 |
 
 服务端和机器人控制机应位于可信局域网，监听地址和客户端目标 IP 必须对应。
 
@@ -402,7 +403,7 @@ domain_id=19
 
 ```bash
 python scripts/xtrainer/run_real.py \
-  --host 127.0.0.1 \
+  --host 策略机的地址 \
   --task "左手拿盒子，右手夹取，并把桌上所有的杂物放进盒子中" \
   --control-hz 30 \
   --max-steps 10000 \
@@ -411,11 +412,30 @@ python scripts/xtrainer/run_real.py \
   --execute
 ```
 
-此外同样可以通过传入 `--log-control` 参数来保存 log 记录。此项仅为机械臂动作关节记录，不涉及图像，不会显著降低速度
+`run_real.py` 的参数如下。`必须传入` 表示命令行缺少该参数就无法运行；`真机必查` 表示参数已有默认值，但启动前必须确认它与 checkpoint、任务或现场硬件一致；其余参数均为按需覆盖的可选项。
 
-三路 RGB 图像默认以质量 85 的 JPEG 压缩后传输，服务端解码为原始尺寸；服务端不支持 JPEG 时会自动回退为原始数组。使用 `--image-jpeg-quality 0` 可关闭压缩。
-
-从第二个动作块开始，客户端默认用 `--chunk-blend-steps 6` 平滑衔接关节目标：在 30 Hz 下过渡约 200 ms，不增加动作步数，夹爪不参与混合。该处理只缓和动作块边界的跳变，不会消除等待推理时的停顿；使用 `--chunk-blend-steps 0` 可关闭。
+| 类型 | 参数 | 默认值 | 作用和注意事项 |
+|---|---|---|---|
+| 必须传入 | `--host` | 无 | XVLA 策略服务的 IP 地址或主机名。 |
+| 必须传入 | `--execute` | 关闭 | 显式允许连接、使能并移动真机；不传时程序会拒绝执行。仅在完成硬件检查、清空工作区并确保急停可触达后启用。 |
+| 真机必查 | `--task` | `pick up the object` | 发送给 XVLA 的任务文本，应与训练数据中的任务描述一致。中文任务可以直接传入。 |
+| 真机必查 | `--domain-id` | `19` | 客户端期望的 XVLA domain，必须与策略服务 metadata 和训练 checkpoint 一致，范围为 `[0, 30)`。 |
+| 可选 | `--port` | `8000` | 策略服务端口，必须与 `serve_policy.py` 的监听端口一致。 |
+| 可选 | `--action-horizon` | `32` | 每次策略响应最多执行的动作步数。缩短动作块时，服务端的 `--actions-per-chunk` 也应同步调整。 |
+| 可选 | `--control-hz` | `30` | 真机动作下发频率。32 步动作块在 30 Hz 下约执行 `1.07` 秒；实际频率还会受通信和硬件耗时影响。 |
+| 可选 | `--max-steps` | `1000` | 整次任务最多执行的动作步总数，不是动作块数量。首次上机建议设为较小值。 |
+| 可选 | `--camera-warmup-frames` | `10` | 每台相机启动后丢弃的预热帧数；设为 `0` 可跳过预热。 |
+| 可选 | `--image-jpeg-quality` | `85` | 三路 RGB 图像的传输 JPEG 质量，范围为 `0–100`；`0` 关闭压缩并发送原始数组。不支持 JPEG 的服务端会自动回退到原始数组。 |
+| 可选 | `--max-joint-delta` | `inf`（关闭） | 环境层单步关节变化上限，单位为弧度；默认不限制。首次上机可显式设置保守值。 |
+| 可选 | `--max-gripper-delta` | `inf`（关闭） | 环境层单步夹爪变化上限；默认不限制。首次上机可显式设置保守值。 |
+| 可选 | `--ramp-step` | `0.01` | 机器人移动到 reset pose 时使用的插值步长，不影响正常策略动作。 |
+| 可选 | `--ramp-max-steps` | `100` | reset pose 插值的最大步数。 |
+| 可选 | `--gripper-update-threshold` | `0.0` | 夹爪目标相对上次指令的最小变化量；`0` 表示发送所有变化。 |
+| 可选 | `--max-delta-per-step` | `0.0`（关闭） | 客户端最终下发前对全部 14 维动作施加的单步变化上限；小于或等于 `0` 时关闭。 |
+| 可选 | `--chunk-blend-steps` | `6` | 从第二个动作块开始，用前 N 步将双臂关节从 hold 位置平滑过渡到模型目标；不处理夹爪，也不增加动作步数。30 Hz、6 步时约过渡 `200 ms`；`0` 关闭。 |
+| 可选 | `--bin-gripper` | 关闭 | 左右夹爪独立判断：模型值低于 `0.5` 时，从上一次实际位置开始，每周期向闭合方向 `0` 递减 `0.05`；不低于 `0.5` 时保留模型原值。30 Hz 下从 `1` 到 `0` 约需 `0.67` 秒。 |
+| 可选 | `--log-control` | 关闭 | 将状态、模型动作和最终下发动作写入客户端 JSONL 日志。日志不保存图像，通常不会显著影响控制速度。 |
+| 可选 | `--control-log-path` | `outputs/xtrainer/control_logs/control_<UTC>.jsonl` | 自定义 `--log-control` 的日志路径；仅在启用 `--log-control` 时生效。 |
 
 ## 14. 关键文件索引
 

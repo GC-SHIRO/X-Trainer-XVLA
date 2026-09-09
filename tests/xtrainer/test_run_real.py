@@ -184,7 +184,7 @@ def test_chunk_blend_rejoins_trajectory_without_changing_grippers():
     np.testing.assert_array_equal(_blend_chunk_action(targets[0], None, 0, 6), targets[0])
 
 
-def test_cli_uses_planned_camera_defaults_and_reserved_switch():
+def test_cli_uses_planned_camera_defaults():
     args = parse_args(["--host", "127.0.0.1"])
 
     assert args.camera_top_serial == "409122273405"
@@ -195,7 +195,6 @@ def test_cli_uses_planned_camera_defaults_and_reserved_switch():
     assert args.action_horizon == 32
     assert args.control_hz == pytest.approx(30.0)
     assert args.domain_id == 19
-    assert args.observation_similarity_epsilon is None
     assert args.execute is False
     assert args.log_control is False
     assert args.bin_gripper is False

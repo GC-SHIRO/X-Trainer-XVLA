@@ -549,12 +549,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path for --log-control (default: outputs/xtrainer/control_logs/control_<UTC>.jsonl)",
     )
     parser.add_argument(
-        "--observation-similarity-epsilon",
-        type=float,
-        default=None,
-        help="Reserved for a later 12-joint observation similarity filter; currently disabled",
-    )
-    parser.add_argument(
         "--execute",
         action="store_true",
         help="Explicitly allow enabling and moving the real robot",
@@ -605,8 +599,6 @@ async def run(
     _validate_args(args)
     if not args.execute:
         raise RuntimeError("Real-robot motion is disabled; pass --execute only after completing safety checks")
-    if args.observation_similarity_epsilon is not None:
-        _LOGGER.warning("--observation-similarity-epsilon is reserved and has no effect in this version")
 
     policy = policy or XTrainerWebSocketPolicyClient(
         f"http://{args.host}:{args.port}", image_jpeg_quality=args.image_jpeg_quality
