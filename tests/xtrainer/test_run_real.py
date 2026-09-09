@@ -21,6 +21,7 @@ from scripts.xtrainer.run_real import (
     _extract_action_chunk,
     _policy_payload,
     _rate_limit_action,
+    _smooth_action_chunk,
     parse_args,
     run,
     run_control_loop,
@@ -184,6 +185,53 @@ def test_chunk_blend_rejoins_trajectory_without_changing_grippers():
     np.testing.assert_array_equal(_blend_chunk_action(targets[0], None, 0, 6), targets[0])
 
 
+def test_chunk_smoothing_reduces_internal_spike_without_changing_ends_or_grippers():
+    actions = np.zeros((5, 14), dtype=np.float64)
+    actions[2, 0] = 1.0
+    actions[:, 6] = np.arange(5)
+    actions[:, 13] = np.arange(5) + 10
+
+    smoothed = _smooth_action_chunk(actions, strength=0.5)
+
+    assert smoothed[2, 0] == pytest.approx(0.5)
+    assert smoothed[1, 0] == pytest.approx(0.25)
+    assert smoothed[3, 0] == pytest.approx(0.25)
+    np.testing.assert_array_equal(smoothed[[0, -1]], actions[[0, -1]])
+    np.testing.assert_array_equal(smoothed[:, [6, 13]], actions[:, [6, 13]])
+    np.testing.assert_array_equal(actions[:, 0], [0, 0, 1, 0, 0])
+
+
+def test_chunk_smoothing_can_be_disabled():
+    actions = np.arange(5 * 14, dtype=np.float64).reshape(5, 14)
+
+    np.testing.assert_array_equal(_smooth_action_chunk(actions, strength=0), actions)
+
+
+def test_control_loop_applies_chunk_smoothing_before_sending_actions():
+    async def exercise():
+        chunk = np.zeros((5, 14), dtype=np.float64)
+        chunk[2, 0] = 1.0
+        environment = MockEnvironment()
+        await run_control_loop(
+            MockPolicy([chunk]),
+            environment,
+            action_horizon=5,
+            control_hz=30,
+            max_steps=5,
+            request_timeout_s=1,
+            max_delta_per_step=0,
+            chunk_blend_steps=0,
+            chunk_smoothing_strength=0.5,
+            monotonic_fn=lambda: 0,
+            sleep_fn=lambda _seconds: asyncio.sleep(0),
+        )
+        return np.asarray(environment.actions)
+
+    actions = asyncio.run(exercise())
+
+    np.testing.assert_allclose(actions[:, 0], [0, 0.25, 0.5, 0.25, 0])
+
+
 def test_cli_uses_planned_camera_defaults():
     args = parse_args(["--host", "127.0.0.1"])
 
@@ -203,6 +251,7 @@ def test_cli_uses_planned_camera_defaults():
     assert math.isinf(args.max_gripper_delta)
     assert args.max_delta_per_step == 0.0
     assert args.chunk_blend_steps == 6
+    assert args.chunk_smoothing_strength == pytest.approx(0.5)
     assert args.ramp_step == pytest.approx(0.01)
     assert args.ramp_max_steps == 100
     assert args.gripper_update_threshold == 0.0
@@ -227,6 +276,14 @@ def test_cli_rejects_invalid_jpeg_quality():
     args = parse_args(["--host", "127.0.0.1", "--image-jpeg-quality", "101"])
 
     with pytest.raises(ValueError, match="image_jpeg_quality"):
+        asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))
+
+
+@pytest.mark.parametrize("strength", ["-0.1", "1.1"])
+def test_cli_rejects_invalid_chunk_smoothing_strength(strength):
+    args = parse_args(["--host", "127.0.0.1", "--chunk-smoothing-strength", strength])
+
+    with pytest.raises(ValueError, match="chunk_smoothing_strength"):
         asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))
 
 

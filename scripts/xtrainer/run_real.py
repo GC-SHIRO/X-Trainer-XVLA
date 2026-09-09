@@ -161,6 +161,26 @@ def _blend_chunk_action(
     return target
 
 
+def _smooth_action_chunk(actions: np.ndarray, strength: float) -> np.ndarray:
+    """对动作段内部的关节目标做一次三点平滑，保留首尾和夹爪。"""
+    chunk = np.asarray(actions, dtype=np.float64)
+    if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected action chunk shape (N, {ACTION_DIM}), got {chunk.shape}")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("chunk smoothing strength must be in [0, 1]")
+
+    smoothed = chunk.copy()
+    if strength <= 0.0 or len(chunk) < 3:
+        return smoothed
+
+    joints = np.r_[0:6, 7:13]
+    neighbor_mean = 0.5 * (chunk[:-2, joints] + chunk[2:, joints])
+    smoothed[1:-1, joints] = (
+        (1.0 - strength) * chunk[1:-1, joints] + strength * neighbor_mean
+    )
+    return smoothed
+
+
 def _crop_top_image(image: np.ndarray) -> np.ndarray:
     """Match the top-camera crop used while collecting the X-trainer dataset."""
     height, width, _ = image.shape
@@ -248,6 +268,7 @@ async def run_control_loop(
     request_timeout_s: float,
     max_delta_per_step: float,
     chunk_blend_steps: int = 6,
+    chunk_smoothing_strength: float = 0.5,
     bin_gripper: bool = False,
     control_log: ControlActionLog | None = None,
     monotonic_fn: Any = time.monotonic,
@@ -264,6 +285,8 @@ async def run_control_loop(
     """
     if chunk_blend_steps < 0:
         raise ValueError("chunk_blend_steps must be non-negative")
+    if not 0.0 <= chunk_smoothing_strength <= 1.0:
+        raise ValueError("chunk_smoothing_strength must be in [0, 1]")
     initial_observation = environment.get_observation()
     initial_result = await _request_action_chunk(
         policy,
@@ -289,11 +312,16 @@ async def run_control_loop(
         # 首段不处理；后续段固定使用已下发的 hold 作为过渡起点。
         blend_anchor = last_sent_action.copy() if last_sent_action is not None else None
         blend_steps = min(chunk_blend_steps, len(result.actions))
-        for action_index, action in enumerate(result.actions):
+        smoothed_actions = _smooth_action_chunk(result.actions, chunk_smoothing_strength)
+        for action_index, (action, smoothed_action) in enumerate(
+            zip(result.actions, smoothed_actions, strict=True)
+        ):
             if step >= max_steps:
                 break
             queued_action = np.asarray(action, dtype=np.float64).copy()
-            blended_action = _blend_chunk_action(queued_action, blend_anchor, action_index, blend_steps)
+            blended_action = _blend_chunk_action(
+                smoothed_action, blend_anchor, action_index, blend_steps
+            )
             bin_gripper_action = (
                 _apply_binary_gripper_close(blended_action, last_gripper_action)
                 if bin_gripper
@@ -312,6 +340,7 @@ async def run_control_loop(
                     source_observation_timestep=result.observation_timestep,
                     used_fallback=False,
                     queued_action=queued_action.tolist(),
+                    smoothed_action=smoothed_action.tolist(),
                     blended_action=blended_action.tolist(),
                     bin_gripper_action=bin_gripper_action.tolist() if bin_gripper else None,
                     rate_limited_action=rate_limited_action.tolist(),
@@ -527,6 +556,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Blend joints from hold over the first N actions of each new chunk; 0 disables it",
     )
     parser.add_argument(
+        "--chunk-smoothing-strength",
+        type=float,
+        default=0.5,
+        help="Three-point smoothing strength for joints inside each chunk; 0 disables it",
+    )
+    parser.add_argument(
         "--bin-gripper",
         action="store_true",
         help=(
@@ -584,10 +619,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         "gripper_update_threshold": args.gripper_update_threshold,
         "max_delta_per_step": args.max_delta_per_step,
         "chunk_blend_steps": args.chunk_blend_steps,
+        "chunk_smoothing_strength": args.chunk_smoothing_strength,
     }
     invalid = [name for name, value in non_negative_values.items() if value < 0]
     if invalid:
         raise ValueError(f"Expected non-negative values for: {', '.join(invalid)}")
+    if args.chunk_smoothing_strength > 1:
+        raise ValueError("chunk_smoothing_strength must be in [0, 1]")
 
 
 async def run(
@@ -629,6 +667,7 @@ async def run(
             request_timeout_s=args.request_timeout,
             max_delta_per_step=args.max_delta_per_step,
             chunk_blend_steps=args.chunk_blend_steps,
+            chunk_smoothing_strength=args.chunk_smoothing_strength,
             bin_gripper=args.bin_gripper,
             control_log=control_log,
         )
