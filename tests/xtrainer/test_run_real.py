@@ -175,7 +175,7 @@ def test_chunk_blend_rejoins_trajectory_without_changing_grippers():
     targets[:, 0] += np.arange(8) * 0.01
     actual = np.array([_blend_chunk_action(a, anchor, i, 6) for i, a in enumerate(targets)])
 
-    assert actual[0, 0] == pytest.approx(0.2 + 0.6 * (2 / 27))
+    assert actual[0, 0] == pytest.approx(anchor[0])
     assert np.all(np.diff(actual[:6, 0]) > 0)
     np.testing.assert_array_equal(actual[:, [6, 13]], targets[:, [6, 13]])
     np.testing.assert_array_equal(actual[5:], targets[5:])
@@ -380,7 +380,7 @@ def test_control_loop_blends_from_applied_hold_without_extra_steps(tmp_path):
     assert len(actions) == 9
     np.testing.assert_allclose(actions[:4], 0.1)
     np.testing.assert_allclose(actions[4], 0.2)
-    assert actions[5, 0] == pytest.approx(0.2 + 0.6 * 0.15625)
+    assert actions[5, 0] == pytest.approx(0.2)
     np.testing.assert_allclose(actions[5:, [6, 13]], 0.8)
     np.testing.assert_allclose(actions[-1], 0.8)
     records = [json.loads(line) for line in (tmp_path / "blend.jsonl").read_text().splitlines()]

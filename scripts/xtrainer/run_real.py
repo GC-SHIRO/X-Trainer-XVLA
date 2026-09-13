@@ -151,10 +151,10 @@ def _blend_chunk_action(
 ) -> np.ndarray:
     """仅在新段开头混合关节目标，夹爪保持原值。"""
     target = np.asarray(action, dtype=np.float64).copy()
-    if anchor is None or blend_steps <= 0 or index >= blend_steps - 1:
+    if anchor is None or blend_steps <= 1 or index >= blend_steps - 1:
         return target
-    # 平滑权重从 hold 位置过渡到当前模型目标，最后一步精确恢复原轨迹。
-    progress = (index + 1) / blend_steps
+    # 首步严格保持 hold 位置，随后平滑过渡，最后一步精确恢复原轨迹。
+    progress = index / (blend_steps - 1)
     weight = progress * progress * (3.0 - 2.0 * progress)
     joints = np.r_[0:6, 7:13]
     target[joints] = anchor[joints] + weight * (target[joints] - anchor[joints])
