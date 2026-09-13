@@ -172,18 +172,10 @@ def test_real_websocket_roundtrip_drives_bounded_mock_hardware_loop(monkeypatch)
     assert np.all(policy.payloads[0]["images"]["right_wrist"] == 33)
     assert all(image.dtype == np.uint8 for image in policy.payloads[0]["images"].values())
 
-    assert len(environment.actions) == 4
+    assert len(environment.actions) == 10
     for action in environment.actions:
         np.testing.assert_array_equal(action, _state())
-    assert environment.events == [
-        "reset",
-        "enable_arms",
-        "apply_action",
-        "apply_action",
-        "apply_action",
-        "apply_action",
-        "close",
-    ]
+    assert environment.events == ["reset", "enable_arms", *("apply_action",) * 10, "close"]
     assert client._session is None
     assert client._ws is None
     assert server._runner is None

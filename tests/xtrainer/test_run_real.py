@@ -18,6 +18,7 @@ from scripts.xtrainer.run_real import (
     ControlActionLog,
     _apply_binary_gripper_close,
     _blend_chunk_action,
+    _ease_out_action_chunk,
     _extract_action_chunk,
     _policy_payload,
     _rate_limit_action,
@@ -207,6 +208,26 @@ def test_chunk_smoothing_can_be_disabled():
     np.testing.assert_array_equal(_smooth_action_chunk(actions, strength=0), actions)
 
 
+def test_chunk_ease_out_reduces_final_joint_increment_and_preserves_grippers():
+    actions = np.zeros((6, 14), dtype=np.float64)
+    actions[:, 0] = np.linspace(0.0, 1.0, 6)
+    actions[:, 6] = np.arange(6)
+    actions[:, 13] = np.arange(6) + 10
+
+    eased = _ease_out_action_chunk(actions, stop_steps=6)
+
+    np.testing.assert_array_equal(eased[[0, -1], 0], actions[[0, -1], 0])
+    assert eased[-1, 0] - eased[-2, 0] < actions[-1, 0] - actions[-2, 0]
+    np.testing.assert_array_equal(eased[:, [6, 13]], actions[:, [6, 13]])
+    np.testing.assert_array_equal(actions[:, 0], np.linspace(0.0, 1.0, 6))
+
+
+def test_chunk_ease_out_can_be_disabled():
+    actions = np.arange(5 * 14, dtype=np.float64).reshape(5, 14)
+
+    np.testing.assert_array_equal(_ease_out_action_chunk(actions, stop_steps=0), actions)
+
+
 def test_control_loop_applies_chunk_smoothing_before_sending_actions():
     async def exercise():
         chunk = np.zeros((5, 14), dtype=np.float64)
@@ -222,6 +243,7 @@ def test_control_loop_applies_chunk_smoothing_before_sending_actions():
             max_delta_per_step=0,
             chunk_blend_steps=0,
             chunk_smoothing_strength=0.5,
+            chunk_stop_steps=0,
             monotonic_fn=lambda: 0,
             sleep_fn=lambda _seconds: asyncio.sleep(0),
         )
@@ -230,6 +252,42 @@ def test_control_loop_applies_chunk_smoothing_before_sending_actions():
     actions = asyncio.run(exercise())
 
     np.testing.assert_allclose(actions[:, 0], [0, 0.25, 0.5, 0.25, 0])
+
+
+def test_control_loop_eases_out_and_holds_before_normal_shutdown():
+    class TrackingEnvironment(MockEnvironment):
+        def get_observation(self):
+            observation = _observation()
+            if self.actions:
+                observation[STATE_KEY] = self.actions[-1].astype(np.float32)
+            return observation
+
+    async def exercise():
+        chunk = np.zeros((6, 14), dtype=np.float64)
+        chunk[:, 0] = np.linspace(0.0, 1.0, 6)
+        environment = TrackingEnvironment()
+
+        await run_control_loop(
+            MockPolicy([chunk]),
+            environment,
+            action_horizon=6,
+            control_hz=30,
+            max_steps=6,
+            request_timeout_s=1,
+            max_delta_per_step=0,
+            chunk_blend_steps=0,
+            chunk_smoothing_strength=0,
+            chunk_stop_steps=6,
+            monotonic_fn=lambda: 0,
+            sleep_fn=lambda _seconds: asyncio.sleep(0),
+        )
+        return np.asarray(environment.actions)
+
+    actions = asyncio.run(exercise())
+
+    assert len(actions) == 12
+    assert actions[5, 0] - actions[4, 0] < 0.2
+    np.testing.assert_allclose(actions[5:, 0], 1.0)
 
 
 def test_cli_uses_planned_camera_defaults():
@@ -252,6 +310,7 @@ def test_cli_uses_planned_camera_defaults():
     assert args.max_delta_per_step == 0.0
     assert args.chunk_blend_steps == 6
     assert args.chunk_smoothing_strength == pytest.approx(0.5)
+    assert args.chunk_stop_steps == 6
     assert args.ramp_step == pytest.approx(0.01)
     assert args.ramp_max_steps == 100
     assert args.gripper_update_threshold == 0.0
@@ -330,6 +389,7 @@ def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
             request_timeout_s=1.0,
             max_delta_per_step=0.0,
             chunk_blend_steps=0,
+            chunk_stop_steps=0,
             monotonic_fn=lambda: 0.0,
             sleep_fn=yield_control,
         )
@@ -367,6 +427,7 @@ def test_control_loop_blends_from_applied_hold_without_extra_steps(tmp_path):
             await run_control_loop(
                 policy, environment, action_horizon=4, control_hz=30, max_steps=8,
                 request_timeout_s=1, max_delta_per_step=0, chunk_blend_steps=6,
+                chunk_stop_steps=0,
                 control_log=log, monotonic_fn=lambda: 0, sleep_fn=sleep,
             )
         finally:
@@ -403,6 +464,7 @@ def test_control_loop_records_hold_without_fallback(tmp_path):
                 max_steps=3,
                 request_timeout_s=1.0,
                 max_delta_per_step=0.0,
+                chunk_stop_steps=0,
                 control_log=control_log,
             )
         finally:
@@ -440,6 +502,7 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
                 max_steps=1,
                 request_timeout_s=1.0,
                 max_delta_per_step=0.0,
+                chunk_stop_steps=0,
                 control_log=control_log,
                 monotonic_fn=lambda: 0.0,
                 sleep_fn=asyncio.sleep,

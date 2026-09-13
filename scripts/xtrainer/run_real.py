@@ -181,6 +181,30 @@ def _smooth_action_chunk(actions: np.ndarray, strength: float) -> np.ndarray:
     return smoothed
 
 
+def _ease_out_action_chunk(actions: np.ndarray, stop_steps: int) -> np.ndarray:
+    """让动作段尾部的关节增量逐渐减小，夹爪和最终目标保持不变。"""
+    chunk = np.asarray(actions, dtype=np.float64)
+    if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected action chunk shape (N, {ACTION_DIM}), got {chunk.shape}")
+    if stop_steps < 0:
+        raise ValueError("chunk stop steps must be non-negative")
+
+    eased = chunk.copy()
+    steps = min(stop_steps, len(chunk))
+    if steps < 3:
+        return eased
+
+    tail_start = len(chunk) - steps
+    progress = np.linspace(0.0, 1.0, steps)
+    # 起始斜率保持接近原轨迹，末端斜率降为 0，避免到达 hold 时瞬停。
+    weight = progress + progress**2 - progress**3
+    joints = np.r_[0:6, 7:13]
+    start = chunk[tail_start, joints]
+    end = chunk[-1, joints]
+    eased[tail_start:, joints] = start + weight[:, None] * (end - start)
+    return eased
+
+
 def _crop_top_image(image: np.ndarray) -> np.ndarray:
     """Match the top-camera crop used while collecting the X-trainer dataset."""
     height, width, _ = image.shape
@@ -269,6 +293,7 @@ async def run_control_loop(
     max_delta_per_step: float,
     chunk_blend_steps: int = 6,
     chunk_smoothing_strength: float = 0.5,
+    chunk_stop_steps: int = 6,
     bin_gripper: bool = False,
     control_log: ControlActionLog | None = None,
     monotonic_fn: Any = time.monotonic,
@@ -287,6 +312,8 @@ async def run_control_loop(
         raise ValueError("chunk_blend_steps must be non-negative")
     if not 0.0 <= chunk_smoothing_strength <= 1.0:
         raise ValueError("chunk_smoothing_strength must be in [0, 1]")
+    if chunk_stop_steps < 0:
+        raise ValueError("chunk stop steps must be non-negative")
     initial_observation = environment.get_observation()
     initial_result = await _request_action_chunk(
         policy,
@@ -311,16 +338,16 @@ async def run_control_loop(
         deadline = monotonic_fn()
         # 首段不处理；后续段固定使用已下发的 hold 作为过渡起点。
         blend_anchor = last_sent_action.copy() if last_sent_action is not None else None
-        blend_steps = min(chunk_blend_steps, len(result.actions))
-        smoothed_actions = _smooth_action_chunk(result.actions, chunk_smoothing_strength)
-        for action_index, (action, smoothed_action) in enumerate(
-            zip(result.actions, smoothed_actions, strict=True)
+        active_actions = result.actions[: max_steps - step]
+        blend_steps = min(chunk_blend_steps, len(active_actions))
+        smoothed_actions = _smooth_action_chunk(active_actions, chunk_smoothing_strength)
+        decelerated_actions = _ease_out_action_chunk(smoothed_actions, chunk_stop_steps)
+        for action_index, (action, smoothed_action, decelerated_action) in enumerate(
+            zip(active_actions, smoothed_actions, decelerated_actions, strict=True)
         ):
-            if step >= max_steps:
-                break
             queued_action = np.asarray(action, dtype=np.float64).copy()
             blended_action = _blend_chunk_action(
-                smoothed_action, blend_anchor, action_index, blend_steps
+                decelerated_action, blend_anchor, action_index, blend_steps
             )
             bin_gripper_action = (
                 _apply_binary_gripper_close(blended_action, last_gripper_action)
@@ -341,6 +368,7 @@ async def run_control_loop(
                     used_fallback=False,
                     queued_action=queued_action.tolist(),
                     smoothed_action=smoothed_action.tolist(),
+                    decelerated_action=decelerated_action.tolist(),
                     blended_action=blended_action.tolist(),
                     bin_gripper_action=bin_gripper_action.tolist() if bin_gripper else None,
                     rate_limited_action=rate_limited_action.tolist(),
@@ -381,6 +409,28 @@ async def run_control_loop(
             request_timeout_s=request_timeout_s,
             control_log=control_log,
         )
+
+    if chunk_stop_steps > 0 and last_sent_action is not None:
+        observation = environment.get_observation()
+        hold_action = np.asarray(observation[STATE_KEY], dtype=np.float64)
+        deadline = monotonic_fn()
+        for hold_index in range(chunk_stop_steps):
+            applied_hold_action = environment.apply_action(hold_action, pace=False)
+            last_sent_action = np.asarray(applied_hold_action, dtype=np.float64).copy()
+            if control_log is not None:
+                control_log.write(
+                    "control_stop_hold",
+                    control_timestep=step,
+                    hold_index=hold_index,
+                    hold_action=hold_action.tolist(),
+                    applied_action=last_sent_action.tolist(),
+                )
+            deadline += period
+            remaining = deadline - monotonic_fn()
+            if remaining > 0:
+                await sleep_fn(remaining)
+            else:
+                deadline = monotonic_fn()
 
     _LOGGER.info("Reached --max-steps=%d; ending the control loop", max_steps)
 
@@ -562,6 +612,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Three-point smoothing strength for joints inside each chunk; 0 disables it",
     )
     parser.add_argument(
+        "--chunk-stop-steps",
+        type=int,
+        default=6,
+        help=(
+            "Ease out joints over the last N actions and hold N cycles before normal shutdown; "
+            "0 disables it"
+        ),
+    )
+    parser.add_argument(
         "--bin-gripper",
         action="store_true",
         help=(
@@ -620,6 +679,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "max_delta_per_step": args.max_delta_per_step,
         "chunk_blend_steps": args.chunk_blend_steps,
         "chunk_smoothing_strength": args.chunk_smoothing_strength,
+        "chunk_stop_steps": args.chunk_stop_steps,
     }
     invalid = [name for name, value in non_negative_values.items() if value < 0]
     if invalid:
@@ -668,6 +728,7 @@ async def run(
             max_delta_per_step=args.max_delta_per_step,
             chunk_blend_steps=args.chunk_blend_steps,
             chunk_smoothing_strength=args.chunk_smoothing_strength,
+            chunk_stop_steps=args.chunk_stop_steps,
             bin_gripper=args.bin_gripper,
             control_log=control_log,
         )
