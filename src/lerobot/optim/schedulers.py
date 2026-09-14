@@ -197,7 +197,7 @@ class XVLALoRAStagedSchedulerConfig(LRSchedulerConfig):
         start = max(0, self.lora_start_step)
         decay_steps = self.num_decay_steps or num_training_steps
 
-        def lr_lambda(current_step: int) -> list[float]:
+        def multiplier(current_step: int, is_lora: bool) -> float:
             warmup = (
                 current_step / max(1, self.num_warmup_steps)
                 if self.num_warmup_steps and current_step < self.num_warmup_steps
@@ -207,14 +207,16 @@ class XVLALoRAStagedSchedulerConfig(LRSchedulerConfig):
             if self.use_cosine_decay:
                 progress = max(0.0, min(1.0, (current_step - start) / max(1, decay_steps - start)))
                 decay = (1 - self.decay_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress)) + self.decay_lr_ratio
-            return [
-                (0.0 if current_step < start else warmup * decay)
-                if group["name"] in {"vlm_lora", "action_lora"}
-                else warmup * decay
-                for group in optimizer.param_groups
-            ]
+            if is_lora and current_step < start:
+                return 0.0
+            return warmup * decay
 
-        return LambdaLR(optimizer, lr_lambda, -1)
+        # Bind each group's flag now rather than capturing the loop variable.
+        callbacks = [
+            lambda step, is_lora=group["name"] in {"vlm_lora", "action_lora"}: multiplier(step, is_lora)
+            for group in optimizer.param_groups
+        ]
+        return LambdaLR(optimizer, callbacks, -1)
 
 
 def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:

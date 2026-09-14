@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies import PreTrainedPolicy
+from lerobot.optim.optimizers import XVLALoRAAdamWConfig
 
 
 def make_optimizer_and_scheduler(
@@ -34,9 +35,12 @@ def make_optimizer_and_scheduler(
     Returns:
         tuple[Optimizer, LRScheduler | None]: The couple (Optimizer, Scheduler). Scheduler can be `None`.
     """
-    params = policy.get_optim_params() if cfg.use_policy_training_preset else policy.parameters()
     if cfg.optimizer is None:
         raise ValueError("Optimizer config is required but not provided in TrainPipelineConfig")
+    if isinstance(cfg.optimizer, XVLALoRAAdamWConfig):
+        params = dict(policy.named_parameters())
+    else:
+        params = policy.get_optim_params() if cfg.use_policy_training_preset else policy.parameters()
     optimizer = cfg.optimizer.build(params)
     lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps) if cfg.scheduler is not None else None
     return optimizer, lr_scheduler

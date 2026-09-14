@@ -48,7 +48,9 @@ def test_lora_config_parses_without_loading_base():
             "model.transformer.action_decoder",
         ]
         assert cfg.dataset.format_version == "v2.1"
-        assert cfg.use_policy_training_preset is True
+        assert cfg.use_policy_training_preset is False
+        assert cfg.optimizer.type == "xvla-lora-adamw"
+        assert cfg.scheduler.type == "xvla-lora-staged"
     finally:
         parser._config_path_args.clear()
         parser._config_yaml_overrides.clear()
