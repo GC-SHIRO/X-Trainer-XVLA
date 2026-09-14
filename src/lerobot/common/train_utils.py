@@ -272,6 +272,10 @@ def save_checkpoint(
             preprocessor.save_pretrained(pretrained_dir)
         if postprocessor is not None:
             postprocessor.save_pretrained(pretrained_dir)
+        if cfg.peft is not None:
+            from lerobot.common.xvla_provenance import save_manifest
+
+            save_manifest(policy_to_save, pretrained_dir)
 
     save_training_state(
         checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
@@ -635,6 +639,9 @@ def publish_trained_model(
             if peft_model is not None:
                 peft_model.save_pretrained(saved_path)  # adapter weights + adapter config
                 model.config.save_pretrained(saved_path)  # PEFT cannot write the policy config
+                from lerobot.common.xvla_provenance import save_manifest
+
+                save_manifest(peft_model, saved_path)
             card = generate_model_card(model_cfg, cfg=cfg, dataset_meta=dataset_meta)
             card.save(str(saved_path / "README.md"))
             cfg.save_pretrained(saved_path)  # train_config.json

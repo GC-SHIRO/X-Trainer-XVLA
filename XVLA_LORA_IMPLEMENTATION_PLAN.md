@@ -264,6 +264,18 @@ model.transformer.action_decoder
 
 ## 7. 产物保存与基座追踪
 
+已接入本地 X-VLA PEFT 训练的基座清单 `xvla_base_manifest.json`：
+
+- 开始训练时计算原始基座 `config.json`、权重及分片索引的 SHA-256 和大小；保存绝对来源路径，但身份比较不依赖该路径。
+- 保存 tokenizer 来源及本地 tokenizer 文件哈希；不自动复制 tokenizer，部署导出时仍需确保相关资源可用。
+- 记录 Python、关键依赖版本、Git commit 和工作区是否存在未提交修改。Git 不可访问时记录 `null`，不伪造代码版本。
+- 每次保存 checkpoint 时复用初始化的基座身份，并生成当前模型产物目录的文件大小和哈希清单。
+- 加载带清单的 X-VLA adapter 前重新计算实际基座身份；配置、权重或索引不匹配时拒绝加载。相同基座搬迁后允许匹配，但加载路径仍需通过 adapter 配置正确提供。
+- 历史 adapter 没有清单时明确警告，不能提供追溯验证；远程基座暂不生成本地文件清单。
+- 沿用现有 adapter、模型配置、训练配置、处理器及 training_state 保存机制，不改变全量模型保存方式。
+
+实现文件为 `src/lerobot/common/xvla_provenance.py`，已接入训练初始化、checkpoint 保存和 adapter 加载。标准库测试覆盖身份比较、搬迁、篡改、历史兼容及文件清单；真实 PEFT 额外模块保存、完整续训和多进程集成仍需训练环境验证。
+
 LoRA 训练产物应包含或明确关联：
 
 - Adapter 权重和 adapter 配置。
