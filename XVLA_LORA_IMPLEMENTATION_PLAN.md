@@ -355,6 +355,28 @@ scripts/xtrainer/merge_xvla_lora.py
 
 ## 9. 复用现有真机部署
 
+代码接入已完成，真实 checkpoint 启动及真机任务验收待进行；本次没有启动服务或连接机器人。
+
+沿用 `configs/xtrainer/deploy.yaml`，通过现有 CLI 覆盖模型路径，无需新增 LoRA 部署配置：
+
+```bash
+python scripts/xtrainer/serve_policy.py \
+  --config configs/xtrainer/deploy.yaml \
+  --checkpoint /data/exports/xvla-merged \
+  --device cuda
+```
+
+也可以修改 YAML 的 `policy.checkpoint`；CLI 优先于 YAML。只指定合并后的完整模型目录，不填写基座或 adapter 路径。服务启动后，机器人客户端继续使用原来的连接与执行方式，不增加热切换。
+
+新增启动前检查：
+
+- 拒绝含 `adapter_config.json` 的独立 adapter 和含 `EXPORT_FAILED.txt` 的失败导出。
+- 对合并产物要求成功的 `merge_report.json`、完整权重、配置、处理器和 tokenizer。
+- 对合并产物禁止处理器加载失败后回退默认处理器，避免误用预处理约定。
+- 原全量 checkpoint 没有合并标记时继续原加载行为；原域编号、动作模式及动作维度校验继续生效。
+
+检查不是模型质量或物理安全认证，也不能替代真实观测测试。现有 safety 配置包含无限动作增量/关节范围，本次不改其行为；首次真机运行前必须自行核对适用限幅、急停和人工接管条件。
+
 已确认：部署加载方式与现有全量模型一致。服务启动时加载一个完整 checkpoint；切换模型时修改 checkpoint 路径并重启服务。
 
 LoRA 必须先与训练时的原始基座合并导出，部署端只读取导出的完整模型。不增加“启动时加载基座 + 独立 adapter”的分支，也不增加运行中的模型或 adapter 热切换功能。
