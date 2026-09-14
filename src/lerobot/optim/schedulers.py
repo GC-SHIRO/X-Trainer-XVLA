@@ -182,6 +182,41 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambda, -1)
 
 
+@LRSchedulerConfig.register_subclass("xvla-lora-staged")
+@dataclass
+class XVLALoRAStagedSchedulerConfig(LRSchedulerConfig):
+    """Enable LoRA groups after an optional action-module adaptation phase."""
+
+    num_warmup_steps: int | None = None
+    lora_start_step: int = 1000
+    use_cosine_decay: bool = False
+    num_decay_steps: int | None = None
+    decay_lr_ratio: float = 0.025
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        start = max(0, self.lora_start_step)
+        decay_steps = self.num_decay_steps or num_training_steps
+
+        def lr_lambda(current_step: int) -> list[float]:
+            warmup = (
+                current_step / max(1, self.num_warmup_steps)
+                if self.num_warmup_steps and current_step < self.num_warmup_steps
+                else 1.0
+            )
+            decay = 1.0
+            if self.use_cosine_decay:
+                progress = max(0.0, min(1.0, (current_step - start) / max(1, decay_steps - start)))
+                decay = (1 - self.decay_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress)) + self.decay_lr_ratio
+            return [
+                (0.0 if current_step < start else warmup * decay)
+                if group["name"] in {"vlm_lora", "action_lora"}
+                else warmup * decay
+                for group in optimizer.param_groups
+            ]
+
+        return LambdaLR(optimizer, lr_lambda, -1)
+
+
 def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
     state_dict = scheduler.state_dict()
     write_json(state_dict, save_dir / SCHEDULER_STATE)

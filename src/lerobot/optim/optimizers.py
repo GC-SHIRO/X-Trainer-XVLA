@@ -231,6 +231,52 @@ class XVLAAdamWConfig(OptimizerConfig):
         )
 
 
+@OptimizerConfig.register_subclass("xvla-lora-adamw")
+@dataclass
+class XVLALoRAAdamWConfig(OptimizerConfig):
+    """AdamW groups for optional staged XVLA LoRA training."""
+
+    lr: float = 1e-4
+    betas: tuple[float, float] = (0.9, 0.99)
+    eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 10.0
+    vlm_lora_lr_scale: float = 1.0
+    action_lora_lr_scale: float = 1.0
+    soft_prompt_lr_scale: float = 1.0
+    action_module_lr_scale: float = 1.0
+
+    def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
+        if not isinstance(params, dict):
+            raise TypeError("XVLA LoRA optimizer requires named parameters.")
+        groups = {"vlm_lora": [], "action_lora": [], "soft_prompts": [], "action_modules": []}
+        for name, param in params.items():
+            if not param.requires_grad:
+                continue
+            lowered = name.lower()
+            if "lora_" in lowered:
+                group = "vlm_lora" if "vlm" in lowered else "action_lora"
+            elif "soft_prompt" in lowered:
+                group = "soft_prompts"
+            elif "action_encoder" in lowered or "action_decoder" in lowered:
+                group = "action_modules"
+            else:
+                raise ValueError(f"Unexpected trainable parameter in LoRA mode: {name}")
+            groups[group].append(param)
+        scales = {
+            "vlm_lora": self.vlm_lora_lr_scale,
+            "action_lora": self.action_lora_lr_scale,
+            "soft_prompts": self.soft_prompt_lr_scale,
+            "action_modules": self.action_module_lr_scale,
+        }
+        param_groups = [
+            {"params": values, "lr": self.lr * scales[name], "name": name, "weight_decay": self.weight_decay}
+            for name, values in groups.items()
+            if values
+        ]
+        return torch.optim.AdamW(param_groups, betas=self.betas, eps=self.eps)
+
+
 @OptimizerConfig.register_subclass("multi_adam")
 @dataclass
 class MultiAdamConfig(OptimizerConfig):
