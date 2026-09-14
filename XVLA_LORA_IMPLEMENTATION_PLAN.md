@@ -294,13 +294,36 @@ LoRA 训练产物应包含或明确关联：
 
 ## 8. 合并导出设计
 
-建议新增独立合并工具，例如：
+已新增 `scripts/xtrainer/merge_xvla_lora.py`。工具实现完成，真实模型合并仍需在具备 torch、PEFT 和实际 checkpoint 的环境验收，不能把文件路径测试视为模型验证通过。
+
+```bash
+python scripts/xtrainer/merge_xvla_lora.py \
+  --base-model /data/original-xvla \
+  --adapter /data/lora/checkpoints/last/pretrained_model \
+  --output-dir /data/exports/xvla-merged \
+  --validation-batch /data/validation/observation.safetensors \
+  --device cuda
+```
+
+`--validation-batch` 是使用训练处理器得到的 Tensor 字典，通过 safetensors 保存。必须包含模型实际使用的图像、状态、语言 token 和正确的 domain_id；不是原始相机文件或任意 pickle。建议使用留出的真实观测。
+
+工具要求有效基座清单及完整的处理器文件，不静默降级为无身份验证导出。输出目录必须不存在且不能与输入目录重叠。合并前检查已记录的 adapter 文件哈希，合并时使用 `safe_merge=True` 并逐张量检查额外训练模块。
+
+默认保留配置精度，可用 `--dtype float32` 或 `--dtype bfloat16` 指定；默认输出比较容限为 `atol=0.001`、`rtol=0.01`，实际容限需要结合精度和动作单位审查。预测前重置策略和随机种子，因为当前 X-VLA 的 noise 参数不会直接控制生成噪声。
+
+输出包含完整权重、策略配置、处理器和 tokenizer，以及 `merge_report.json`。原基座清单作为来源记录保留，其中 artifacts 描述的是源 adapter 而非新模型。不会把 adapter 的训练配置伪装成完整模型续训配置，也不会复制训练优化器状态。
+
+任何保存后的验证失败都会留下 `EXPORT_FAILED.txt`；此目录不得部署，也不会自动删除用户文件。成功必须同时通过合并前后输出、额外模块权重、严格重新加载和处理器重新加载检查。
+
+限制：当前模型加载器使用单个 `model.safetensors`；工具按此契约要求本地基座。导出时同时保留合并模型和重载模型，需为校验预留额外内存。策略 fallback 的 tokenizer 路径记录为导出绝对路径；迁移目录时应使用带相对 tokenizer 资源的保存处理器，不应退回旧路径。
+
+已新增独立合并工具：
 
 ```text
 scripts/xtrainer/merge_xvla_lora.py
 ```
 
-名称为建议，接口尚未实现。
+接口及当前验证边界见本节开头。
 
 输入：
 
