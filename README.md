@@ -1,16 +1,18 @@
 # X-Trainer 部署 XVLA 手册
 
 版本：V1.0  
-日期：2026-09-06
+更新日期：2026-09-25
 适用代码：`GC-SHIRO/X-Trainer-XVLA` `main`
 
 ---
 
 ## 1. 文档目标
 
-本文用于在 Dobot X-Trainer 双臂平台上完成 XVLA 的数据采集、数据转换、全量微调和真机部署。
+本文用于在 Dobot X-Trainer 双臂平台上完成 XVLA 的数据采集、数据转换、全量微调或 LoRA 微调和真机部署。
 
 流程：硬件检查 -> 遥操作采集 -> LeRobot Dataset v2.1 -> 数据校验 -> XVLA 全量微调 -> 策略服务 -> 真机执行。
+
+LoRA 路线见第 15 节：官方原始基座 -> LoRA 微调 -> 合并导出完整模型 -> 复用第 12、13 节的服务和真机客户端。
 
 ## 2. 总体架构
 
@@ -35,6 +37,8 @@ X-Trainer 硬件
 | 数据转换 | `scripts/xtrainer/convert_raw_to_lerobot_2_1.py` | 写入 LeRobot Dataset v2.1。 |
 | 数据校验 | `scripts/xtrainer/validate_dataset_v21.py` | 检查字段、维度、统计量、视频和 episode。 |
 | 训练 | `scripts/xtrainer/train_xvla.sh` | 使用 `configs/xtrainer/train_xvla.yaml` 训练。 |
+| LoRA 训练 | `scripts/xtrainer/train_xvla_lora.sh` | 独立 LoRA 配置、梯度累积和续训入口。 |
+| LoRA 导出 | `scripts/xtrainer/merge_xvla_lora.py` | 校验基座、合并 adapter 并验证完整模型输出。 |
 | 策略服务 | `scripts/xtrainer/serve_policy.py` | 通过 WebSocket + MessagePack 提供动作。 |
 | 真机客户端 | `scripts/xtrainer/run_real.py` | 读取状态和图像并下发动作。 |
 
@@ -483,5 +487,215 @@ scripts/xtrainer/run_real.py
 configs/xtrainer/train_xvla.yaml
 configs/xtrainer/deploy.yaml
 ```
+
+## 15. XVLA LoRA 微调与部署
+
+本节按当前仓库实现编写。LoRA 不依赖已有全量微调模型；使用本地官方原始 checkpoint 作为基座，训练后与同一份基座合并。
+
+```text
+本地官方原始基座 + LeRobot v2.1 数据
+    -> LoRA adapter + 额外训练模块
+    -> 与原始基座合并
+    -> 完整 checkpoint
+    -> serve_policy.py
+    -> run_real.py
+```
+
+独立 adapter 不能直接传给当前真机部署入口。全量模型无需执行 LoRA 合并步骤。所有示例在已配置环境的 Linux/Bash 中，从仓库根目录执行；路径替换为实际值。
+
+### 15.1 环境与路径
+
+LoRA 需要 PEFT。安装脚本当前安装的 extras 没有显式包含 `peft`，请在同一个训练环境中检查：
+
+```bash
+conda activate xtrainer-xvla
+python -c "import torch, peft, transformers, accelerate; print('LoRA imports OK')"
+```
+
+若缺少 PEFT，可在该环境补装项目对应 extra：
+
+```bash
+python -m pip install -e ".[peft]"
+```
+
+这会解析并可能调整相关依赖；已有可用环境应先记录版本。导入成功不代表真实训练或模型兼容性已经验证。
+
+编辑 `configs/xtrainer/train_xvla_lora.yaml`：
+
+| 字段 | 应填写的内容 |
+|---|---|
+| `dataset.root` | 本地 LeRobot v2.1 数据集目录 |
+| `policy.path` | 本地官方原始模型目录，当前加载器使用 `config.json` 和 `model.safetensors` |
+| `policy.tokenizer_name` | 实际可加载的 tokenizer 目录，不假定一定在基座的 `tokenizer/` 下 |
+| `output_dir` | 新的 LoRA 实验目录，避免覆盖已有模型 |
+
+启动脚本的 `--base-model`、`--dataset-root`、`--output-dir` 在首次训练时覆盖相应 YAML 值。Tokenizer 没有独立脚本参数，需在 YAML 中填写。相对路径以进程工作目录为基准，建议使用绝对路径。
+
+### 15.2 当前训练配方
+
+| 配置 | 当前值 / 含义 |
+|---|---|
+| `peft.r` / `lora_alpha` | `8` / `16` |
+| `target_modules` | `all-linear`，不只适配动作 Transformer |
+| `full_training_modules` | `model.transformer.soft_prompt_hub`、`action_encoder`、`action_decoder` 三个完整路径所指模块 |
+| `optimizer.type` | `xvla-lora-adamw`，四组参数独立倍率 |
+| `scheduler.type` | `xvla-lora-staged` |
+| `lora_start_step` | `1000`，在此之前两类 LoRA 参数组学习率为 0 |
+| Warmup / 余弦 | 当前关闭：`num_warmup_steps: null`、`use_cosine_decay: false` |
+| `use_policy_training_preset` | `false`，保留显式 LoRA optimizer/scheduler |
+| Batch / 总循环步数 | `8` / `30000` |
+| 数据加载 workers | `4` |
+| 保存频率 | `20000` |
+
+适配阶段仍计算梯度，学习率为 0 不等于跳过反向传播。LoRA 也不自动减少输入图像、模型前向计算或总训练步数，因此不能只按可训练参数比例估计速度。
+
+当前可选 warmup 按 scheduler 的全局计数计算，不是从 `lora_start_step` 后重新计数。启用 warmup 或余弦时应先验证实际各组学习率曲线。
+
+YAML 文件头部“调度器尚未实现”“只能直接使用 lerobot-train”的注释已过时：代码已有独立调度器和下述 LoRA 启动入口。不要改用全量启动脚本，它有自动本地基座覆盖逻辑。
+
+### 15.3 图像与语言输入
+
+LoRA 与全量训练共用 X-VLA 图像处理器：相机键映射、float 范围转换、ImageNet 归一化。三路相机、裁剪/旋转、分辨率和数据增强设置应与实验约定一致。
+
+两份 YAML 未显式指定 `resize_imgs_with_padding`，其实际值还可能继承基座配置。使用离线变换过的数据集时，部署也必须匹配，不能认为 LoRA 会自动替你缩图。
+
+训练命令没有单独的 `--language`：语言来自数据集的 `task_index` 对应的 `meta/tasks.jsonl` 文本，经 tokenizer 编码输入模型。查看实际指令：
+
+```bash
+head -n 20 /data/xtrainer/dataset_v21/meta/tasks.jsonl
+```
+
+推理时通过 `run_real.py --task "训练数据中的任务文本"` 提供语言输入。`tokenizer_name` 是分词器路径，不是任务文本。
+
+### 15.4 短训练与正式训练
+
+先填写 YAML 中的 tokenizer 等路径，再运行短训练：
+
+```bash
+bash scripts/xtrainer/train_xvla_lora.sh \
+  --base-model /data/models/xvla-original \
+  --dataset-root /data/xtrainer/dataset_v21 \
+  --config configs/xtrainer/train_xvla_lora.yaml \
+  --output-dir outputs/train/xtrainer_xvla_lora_smoke \
+  --device cuda \
+  --batch-size 1 \
+  --steps 20 \
+  --grad-accum 1 \
+  --no-wandb
+```
+
+20 步只检查初始化和数据/训练通路，不跨过默认适配阶段，也不证明模型学会任务。需要阶段切换测试时，使用独立测试配置缩短 `lora_start_step` 并调整保存频率。
+
+正式训练示例：
+
+```bash
+bash scripts/xtrainer/train_xvla_lora.sh \
+  --base-model /data/models/xvla-original \
+  --dataset-root /data/xtrainer/dataset_v21 \
+  --config configs/xtrainer/train_xvla_lora.yaml \
+  --output-dir outputs/train/xtrainer_xvla_lora \
+  --device cuda \
+  --batch-size 8 \
+  --steps 30000 \
+  --grad-accum 1
+```
+
+默认执行数据校验。`--skip-validation` 仅跳过该步骤；首次运行不建议跳过。`--no-wandb` 覆盖 `wandb.enable=false`，适用于不使用 W&B 的运行。
+
+脚本还会尝试发现当前 Python 中 `nvidia.cudnn` 的 `lib` 目录，并加入当前进程的 `LD_LIBRARY_PATH`。这不是 CUDA/cuDNN 安装命令，也不保证所有动态库问题都已解决。
+
+### 15.5 梯度累积与耗时
+
+显存不足时可以尝试减小单次 batch，并显式使用：
+
+```text
+--batch-size 2 --grad-accum 4
+```
+
+单卡上每次完整累积的有效 batch 为 `2 × 4 = 8`。梯度累积不是自动加速：它用更多 micro-batch 换取较小的单次 batch 内存需求。
+
+**当前训练外层 `step` 每个 micro-batch 增加一次。** 所以 `--steps 30000 --grad-accum 4` 不能直接理解成 30000 次实际优化器更新，通常约为 7500 次，边界还受数据加载和 Accelerator 行为影响。日志、保存频率和 scheduler 计数不要混为同一含义；多卡及累积场景需核对真实学习率轨迹。
+
+排查慢训练时记录 GPU 型号/利用率、图像实际尺寸、日志 `data_s` 和 `updt_s`，先区分数据读取瓶颈、模型计算和总循环次数。
+
+### 15.6 LoRA 断点续训与基座身份
+
+```bash
+bash scripts/xtrainer/train_xvla_lora.sh \
+  --base-model /data/models/xvla-original \
+  --dataset-root /data/xtrainer/dataset_v21 \
+  --resume-checkpoint outputs/train/xtrainer_xvla_lora/checkpoints/last/pretrained_model \
+  --no-wandb
+```
+
+保留完整 checkpoint，包括 `pretrained_model` 旁边的 `training_state`，后者包含续训所需的优化器、调度器、随机状态和训练步数。
+
+当前脚本恢复时仍要求 `--base-model` 指向存在的目录，但不会把它转发为 `policy.path`；实际基座来自 adapter 配置。**改变该参数并不能重定位 resume 所用的基座。** 基座迁移后要正确处理 adapter 来源路径，并保持内容一致。
+
+本地 X-VLA adapter 会记录 `xvla_base_manifest.json`，保存基座配置/权重哈希及来源等信息。恢复时基座内容不匹配会被拒绝；不要删除清单绕过验证。首次训练会计算基座文件哈希，大模型初始化可能因此增加耗时。
+
+为保证恢复一致性，不建议在续训时随意改变数据、梯度累积、总步数和调度参数。旧 adapter 无清单时加载会警告，但下述合并工具要求清单存在。
+
+### 15.7 合并导出完整模型
+
+准备一份与训练处理器一致的观测 Tensor 字典，保存为 safetensors，用于比较合并前后的动作输出。文件必须包含模型要求的图像、状态、语言 token 和正确的域字段；不是原始图片或数据集目录。
+
+当前没有一键生成验证观测的专用 CLI。如何从已预处理的 batch 保存文件，见 [LoRA 训练与推理指南](XVLA_LORA_TRAIN_INFERENCE_GUIDE.md)第 6 节。
+
+```bash
+python scripts/xtrainer/merge_xvla_lora.py \
+  --base-model /data/models/xvla-original \
+  --adapter outputs/train/xtrainer_xvla_lora/checkpoints/last/pretrained_model \
+  --output-dir outputs/exports/xtrainer_xvla_lora_merged \
+  --validation-batch /data/validation/observation.safetensors \
+  --device cuda
+```
+
+要求及产物：
+
+- 基座与训练时一致，adapter 清单、处理器和权重齐全。
+- 输出目录必须不存在，且不能与源目录重叠。
+- 工具合并 LoRA，保留额外完整训练模块；校验这些模块权重及固定种子下的动作输出。
+- 保存完整模型和 tokenizer/处理器，再用 `XVLAPolicy.from_pretrained` 严格重载验证。
+- 成功写入 `merge_report.json`；出现 `EXPORT_FAILED.txt` 的目录不能部署。
+- 默认保留精度，可选 `--dtype float32` / `bfloat16`；输出比较默认 `--atol 0.001 --rtol 0.01`，不是机器人动作安全阈值。
+- 重载检查需要额外内存/显存；合并目录不包含用于 LoRA 续训的优化器状态，原 adapter 和基座应另外保留。
+
+### 15.8 复用现有策略服务
+
+```bash
+python scripts/xtrainer/serve_policy.py \
+  --config configs/xtrainer/deploy.yaml \
+  --checkpoint outputs/exports/xtrainer_xvla_lora_merged \
+  --device cuda \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --actions-per-chunk 32
+```
+
+同机可使用上述监听地址；跨机使用可信局域网地址或按现场网络配置监听。机器人客户端沿用第 13 节，不增加基座或 adapter 参数。切换完整模型时先停止机器人执行，再修改 checkpoint 路径并重启服务，不支持运行中热切换。
+
+部署会拒绝独立 adapter、失败导出和不完整的合并产物；合并模型处理器加载失败不会回退默认预处理。
+
+第 13 节的硬件和运动授权检查仍适用：`--execute` 允许启用及移动机械臂，可能包含任务前复位；小步数或低频率不保证安全，必须按现场条件检查限幅、初始姿态和硬件急停。
+
+### 15.9 代码与验证范围
+
+| 文件 | 作用 |
+|---|---|
+| `configs/xtrainer/train_xvla_lora.yaml` | LoRA 训练参数 |
+| `scripts/xtrainer/train_xvla_lora.sh` | 本地训练、梯度累积及恢复启动 |
+| `src/lerobot/optim/optimizers.py`、`schedulers.py` | LoRA 四组参数及独立调度 |
+| `src/lerobot/common/xvla_provenance.py` | 基座清单与身份校验 |
+| `scripts/xtrainer/merge_xvla_lora.py` | 合并、导出与数值验证 |
+| `deploy/xtrainer/checkpoint_validation.py` | 部署产物启动检查 |
+
+本文更新基于代码核对，没有重新运行真实训练、合并或真机任务。短训练、梯度累积的学习率轨迹、断点恢复以及合并输出仍需在实际训练环境中验收。
+
+进一步说明：
+
+- [LoRA 实施方案](XVLA_LORA_IMPLEMENTATION_PLAN.md)
+- [LoRA 训练与推理操作指南](XVLA_LORA_TRAIN_INFERENCE_GUIDE.md)
+- [训练后真机部署指南](XVLA_REAL_ROBOT_DEPLOY_GUIDE.md)
 
 
