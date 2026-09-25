@@ -30,6 +30,7 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+from pathlib import Path
 import sys
 import time
 from collections.abc import Iterator
@@ -508,6 +509,14 @@ def train(cfg: TrainPipelineConfig):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
         peft_model = policy
+        if cfg.policy.type == "xvla" and not hasattr(policy, "_xvla_base_manifest"):
+            from lerobot.common.xvla_provenance import create_manifest
+
+            base = policy.peft_config["default"].base_model_name_or_path
+            if Path(base).is_dir():
+                policy._xvla_base_manifest = create_manifest(base, cfg.policy.tokenizer_name)
+            else:
+                logging.warning("XVLA base manifest requires a local checkpoint; skipping for %s", base)
 
     accelerator.wait_for_everyone()
 

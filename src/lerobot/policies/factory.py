@@ -385,6 +385,11 @@ def make_policy(
             )
 
         kwargs["revision"] = peft_config.revision
+        base_manifest = None
+        if cfg.type == "xvla":
+            from lerobot.common.xvla_provenance import verify_manifest
+
+            base_manifest = verify_manifest(peft_pretrained_path, peft_config.base_model_name_or_path)
         policy = policy_cls.from_pretrained(**kwargs)
         policy = PeftModel.from_pretrained(
             policy,
@@ -393,6 +398,8 @@ def make_policy(
             revision=cfg.pretrained_revision,
             is_trainable=True,
         )
+        if base_manifest is not None:
+            policy._xvla_base_manifest = base_manifest
 
     else:
         # Make a fresh policy.

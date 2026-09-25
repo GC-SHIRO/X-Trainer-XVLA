@@ -32,6 +32,7 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 from lerobot.policies.xvla.processor_xvla import make_xvla_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from deploy.xtrainer.checkpoint_validation import validate_deployment_checkpoint
 
 STATE_DIM = 14
 ACTION_DIM = 14
@@ -69,6 +70,7 @@ class XVLAXTrainerPolicy:
         self._action_log_path = Path(action_log_path) if action_log_path is not None else None
         self._action_log_file = None
 
+        self._is_merged_export = validate_deployment_checkpoint(checkpoint)
         self.policy = self._load_policy(checkpoint, device)
         self._resolve_domain_id()
         self._validate_policy_contract()
@@ -141,6 +143,8 @@ class XVLAXTrainerPolicy:
                 },
             )
         except (FileNotFoundError, OSError):
+            if getattr(self, "_is_merged_export", False):
+                raise
             # No saved processor pipeline next to the checkpoint: build defaults from config.
             return make_xvla_pre_post_processors(config=self.policy.config)
 
