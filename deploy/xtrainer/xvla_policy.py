@@ -28,11 +28,11 @@ from typing import Any
 import numpy as np
 import torch
 
+from deploy.xtrainer.checkpoint_validation import validate_deployment_checkpoint
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 from lerobot.policies.xvla.processor_xvla import make_xvla_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
-from deploy.xtrainer.checkpoint_validation import validate_deployment_checkpoint
 
 STATE_DIM = 14
 ACTION_DIM = 14
@@ -55,6 +55,7 @@ class XVLAXTrainerPolicy:
         reset_pose: list[float] | None = None,
         warmup: bool = True,
         action_log_path: str | Path | None = None,
+        rtc: dict[str, Any] | None = None,
     ) -> None:
         self.device = device
         self.actions_per_chunk = actions_per_chunk
@@ -74,6 +75,27 @@ class XVLAXTrainerPolicy:
         self.policy = self._load_policy(checkpoint, device)
         self._resolve_domain_id()
         self._validate_policy_contract()
+        self.rtc_processor = None
+        rtc_options = dict(rtc or {})
+        mode = rtc_options.pop("mode", "guided")
+        if mode != "guided":
+            raise ValueError("XVLA deployment supports rtc.mode='guided' only")
+        self.rtc_enabled = bool(rtc_options.get("enabled", False))
+        if self.rtc_enabled:
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
+            from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+            rtc_config = RTCConfig(**rtc_options)
+            if (
+                type(rtc_config.execution_horizon) is not int
+                or not 0 < rtc_config.execution_horizon <= self.policy.config.chunk_size
+            ):
+                raise ValueError("RTC execution_horizon must be within [1, checkpoint chunk_size]")
+            if not np.isfinite(rtc_config.max_guidance_weight):
+                raise ValueError("RTC max_guidance_weight must be finite")
+            if self.actions_per_chunk != self.policy.config.chunk_size:
+                raise ValueError("RTC requires the full checkpoint chunk_size")
+            self.rtc_processor = RTCProcessor(rtc_config)
         self.preprocessor, self.postprocessor = self._load_processors(checkpoint)
 
         if warmup:
@@ -127,9 +149,9 @@ class XVLAXTrainerPolicy:
                 "Checkpoint is not adapted to X-trainer: "
                 f"expected real action dim {ACTION_DIM}, got {real_action_dim!r}"
             )
-        if self.actions_per_chunk > int(config.chunk_size):
+        if not 0 < self.actions_per_chunk <= int(config.chunk_size):
             raise ValueError(
-                f"actions_per_chunk={self.actions_per_chunk} exceeds checkpoint chunk_size={config.chunk_size}"
+                f"actions_per_chunk={self.actions_per_chunk} must be within [1, checkpoint chunk_size={config.chunk_size}]"
             )
 
     def _load_processors(self, checkpoint: str):
@@ -151,8 +173,21 @@ class XVLAXTrainerPolicy:
     def _warmup(self) -> None:
         state = np.zeros(STATE_DIM, dtype=np.float32)
         images = {name: np.zeros((480, 640, 3), dtype=np.uint8) for name in self.camera_keys}
-        self.infer({"state": state, "images": images, "task": "warmup"})
-        self.reset()
+        payload = {"state": state, "images": images, "task": "warmup"}
+        device = torch.device(self.device)
+        devices = (
+            [device.index if device.index is not None else torch.cuda.current_device()]
+            if device.type == "cuda"
+            else []
+        )
+        with torch.random.fork_rng(devices=devices):
+            try:
+                result = self.infer(payload)
+                if self.rtc_enabled:
+                    payload.update(prev_chunk_left_over=result["model_action"], inference_delay=1)
+                    self.infer(payload)
+            finally:
+                self.reset()
 
     def metadata(self) -> dict[str, Any]:
         info = {
@@ -161,6 +196,7 @@ class XVLAXTrainerPolicy:
             "action_dim": ACTION_DIM,
             "state_dim": STATE_DIM,
             "chunk_size": self.actions_per_chunk,
+            "rtc_enabled": self.rtc_enabled,
             "domain_id": self.domain_id,
         }
         if self.reset_pose is not None:
@@ -169,6 +205,12 @@ class XVLAXTrainerPolicy:
 
     def reset(self) -> None:
         self.policy.reset()
+        if self.rtc_processor is not None:
+            self.rtc_processor.reset_tracker()
+        for processor in (self.preprocessor, self.postprocessor):
+            reset = getattr(processor, "reset", None)
+            if callable(reset):
+                reset()
 
     def close(self) -> None:
         """Close the optional action log file when the policy server stops."""
@@ -180,15 +222,41 @@ class XVLAXTrainerPolicy:
         started = time.perf_counter()
         self._validate_payload(payload)
         batch = self._build_batch(payload)
+        kwargs = {}
+        if self.rtc_enabled:
+            previous = payload.get("prev_chunk_left_over")
+            delay = payload.get("inference_delay", 0)
+            if type(delay) is not int or delay < 0:
+                raise ValueError("inference_delay must be a nonnegative integer")
+            if previous is not None:
+                previous = np.asarray(previous, dtype=np.float32)
+                if (
+                    previous.ndim != 2
+                    or previous.shape[1] != ACTION_DIM
+                    or not 0 < len(previous) <= self.actions_per_chunk
+                    or not np.isfinite(previous).all()
+                    or delay >= len(previous)
+                ):
+                    raise ValueError("Invalid RTC prefix or insufficient delay coverage")
+                previous = torch.from_numpy(previous.copy()).to(self.device).unsqueeze(0)
+            elif delay != 0:
+                raise ValueError("inference_delay must be zero without an RTC prefix")
+            kwargs = {
+                "rtc_processor": self.rtc_processor,
+                "prev_chunk_left_over": previous,
+                "inference_delay": delay,
+            }
 
-        with torch.inference_mode():
+        # RTC locally enables autograd; inference_mode would prohibit that.
+        with torch.no_grad():
             preprocess_started = time.perf_counter()
             transition = self.preprocessor(batch)
             self._synchronize_device()
             preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
 
             predict_started = time.perf_counter()
-            actions = self.policy.predict_action_chunk(transition)
+            actions = self.policy.predict_action_chunk(transition, **kwargs)
+            model_actions = actions.detach().float().cpu().numpy().copy() if self.rtc_enabled else None
             self._synchronize_device()
             predict_ms = (time.perf_counter() - predict_started) * 1000.0
 
@@ -214,7 +282,15 @@ class XVLAXTrainerPolicy:
             postprocess_ms,
             actions_np.shape[0],
         )
-        return {self.action_key: actions_np.astype(np.float32)}
+        result = {self.action_key: actions_np.astype(np.float32)}
+        if self.rtc_enabled:
+            expected_shape = (1, self.actions_per_chunk, ACTION_DIM)
+            if model_actions.shape != expected_shape or not np.isfinite(model_actions).all():
+                raise ValueError("Model returned an incomplete or non-finite RTC action chunk")
+            if actions_np.shape != expected_shape[1:]:
+                raise ValueError("Postprocessor returned an incomplete RTC action chunk")
+            result["model_action"] = model_actions[0]
+        return result
 
     def _synchronize_device(self) -> None:
         """Flush pending CUDA work so measured segments reflect GPU time."""

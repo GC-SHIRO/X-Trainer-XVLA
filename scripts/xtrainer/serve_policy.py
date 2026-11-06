@@ -120,6 +120,7 @@ def main() -> None:
         reset_pose=list(XTRAINER_RESET_POSE),
         warmup=not args.no_warmup,
         action_log_path=action_log_path,
+        rtc=policy_cfg.get("rtc"),
     )
 
     server = XTrainerWebSocketPolicyServer(

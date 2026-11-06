@@ -403,76 +403,168 @@ bash scripts/xtrainer/train_xvla.sh \
 
 续训时选择上一次训练生成的 `last/pretrained_model`。如果更换了数据集或任务，应重新确认训练结果是否仍然具有可比性。
 
-## 12. 启动策略服务
+## 12. 启动策略服务（serve_policy.py）
+
+在运行模型的机器上启动服务，再到连接机械臂和相机的控制机上运行第 13 节的客户端。以下命令使用 Linux/Bash，在仓库根目录执行，并使用已安装项目依赖的 Python 环境。
+
+### 12.1 默认启动：guided RTC
 
 ```bash
 python scripts/xtrainer/serve_policy.py \
-  --checkpoint 对应的 pretrained_model 目录 \
+  --config configs/xtrainer/deploy.yaml \
+  --checkpoint outputs/train/xtrainer_xvla/checkpoints/last/pretrained_model \
   --device cuda \
-  --actions-per-chunk 32 
+  --host 0.0.0.0 \
+  --port 8000 \
+  --actions-per-chunk 32
 ```
 
-`serve_policy.py` 的命令行参数均为可选覆盖项；未指定时从 `configs/xtrainer/deploy.yaml` 读取。checkpoint 和 domain 虽然已有配置默认值，但启动前必须确认。
+将 `--checkpoint` 换成实际模型目录。checkpoint 是训练后保存的模型和配置；如果使用 LoRA 微调，需要先合并导出完整模型，见第 15 节。`32` 必须与该 checkpoint 的 `config.json` 中 `chunk_size` 一致，不能为了加快响应任意缩短。
 
-| 类型 | 参数 | 默认值或来源 | 作用和注意事项 |
-|---|---|---|---|
-| 配置必查 | `--checkpoint` / `--model-path` | `policy.checkpoint` | 要部署的 `pretrained_model` 目录；两个参数名等价。必须使用完成 X-Trainer 微调后的 checkpoint。 |
-| 配置必查 | `--domain-id` | `policy.domain_id` | 覆盖 XVLA domain，必须与 checkpoint 训练时的 domain 一致。命令行和 YAML 都不指定时自动读取 checkpoint；显式冲突时直接报错。 |
-| 可选 | `--config` | `configs/xtrainer/deploy.yaml` | 部署配置文件路径。 |
-| 可选 | `--device` | `policy.device`，当前为 `cuda` | 模型加载和推理设备。 |
-| 可选 | `--host` | `network.host`，当前为 `0.0.0.0` | 服务监听地址。`0.0.0.0` 表示监听本机所有网络接口。 |
-| 可选 | `--port` | `network.port`，当前为 `8000` | 服务监听端口，必须与 `run_real.py --port` 一致。 |
-| 可选 | `--actions-per-chunk` / `--use-length` | `policy.actions_per_chunk`，当前为 `32` | 每次推理返回的动作步数；两个参数名等价，且不能超过 checkpoint 的 `chunk_size`。 |
-| 可选 | `--log-actions` | 关闭 | 将每次返回的动作块和输入图像写入 JSONL。图像数据会使文件快速增大并影响推理速度，仅建议短时调试。 |
-| 可选 | `--action-log-path` | `outputs/xtrainer/action_logs/actions_<UTC>.jsonl` | 自定义动作日志路径；仅在启用 `--log-actions` 时生效。 |
-| 可选 | `--no-warmup` | 关闭 | 跳过服务启动时的首次 warmup 推理，主要用于排查模型加载问题；正常部署建议保留 warmup。 |
+默认的 `configs/xtrainer/deploy.yaml` 已启用以下设置。此处只是文件中的相关片段，修改现有字段即可，不要用它覆盖整个部署文件：
 
-服务端和机器人控制机应位于可信局域网，监听地址和客户端目标 IP 必须对应。
+```yaml
+policy:
+  actions_per_chunk: 32
+  rtc:
+    enabled: true
+    mode: guided
+    execution_horizon: 10
+    max_guidance_weight: 10.0
+```
 
+RTC（实时动作段衔接）让机器人执行当前动作段的同时，提前生成下一段。`guided` 表示生成时参考旧段中尚未执行的动作，减少切换时的突变，无需重新训练模型。
 
-## 13. 启动真机任务
+| YAML 字段 | 当前值 | 含义与约束 |
+|---|---|---|
+| `policy.rtc.enabled` | `true` | 开启 RTC；设为 `false` 后改为执行完一段、保持当前位置并等待下一次推理。省略整个 `rtc` 配置时也关闭。 |
+| `policy.rtc.mode` | `guided` | 当前只支持此模式；填写 `trained` 或其他值会报错。 |
+| `policy.rtc.execution_horizon` | `10` | 参与衔接引导的前缀范围，必须是 `1` 到 `chunk_size` 之间的整数。前缀就是旧段尚未执行的部分。预计延迟较大时，实际引导范围会扩大以覆盖延迟，但不超过已有前缀。 |
+| `policy.rtc.max_guidance_weight` | `10.0` | 引导强度的上限，必须是有限正数；初始沿用 Pi05 的设置，效果需要实测。 |
 
-首次运行使用较小步数和动作增量：
+RTC 通过 YAML 配置，**没有 `--rtc` 或 `--mode` 命令行参数**。修改后需要重启策略服务。客户端连接时读取服务端信息，自动选择 RTC 或同步分块模式。
+
+### 12.2 服务端参数
+
+模型、domain、设备、监听地址、端口和动作段长度的命令行选项优先于 YAML。domain 是训练时使用的任务域编号，用于选择模型内对应的提示参数；必须与 checkpoint 一致。
+
+| 参数 | 默认值或来源 | 作用和注意事项 |
+|---|---|---|
+| `--config` | `configs/xtrainer/deploy.yaml` | 部署配置文件路径。 |
+| `--checkpoint` / `--model-path` | `policy.checkpoint` | 完整 `pretrained_model` 目录；两个参数名等价。 |
+| `--domain-id` | `policy.domain_id`，当前为 `19` | 覆盖任务域编号。命令行和 YAML 都不指定时，自动读取 checkpoint；显式指定但与 checkpoint 冲突时会报错。 |
+| `--device` | `policy.device`，当前为 `cuda` | 模型推理设备。 |
+| `--host` | `network.host`，当前为 `0.0.0.0` | 服务监听地址。`0.0.0.0` 表示监听本机所有网络接口；客户端应填写这台机器可访问的实际 IP。 |
+| `--port` | `network.port`，当前为 `8000` | 服务端口，必须与客户端 `--port` 一致。 |
+| `--actions-per-chunk` / `--use-length` | `policy.actions_per_chunk`，当前为 `32` | 每次返回的动作步数。RTC 开启时必须等于 checkpoint 的完整 `chunk_size`；关闭时可取 `1` 到 `chunk_size`。 |
+| `--no-warmup` | 不启用，默认进行预热 | 跳过启动预热。RTC 开启时，默认会预热首次推理和带旧动作前缀的推理；预热完成后才启动网络监听。 |
+| `--log-actions` | 关闭 | 将返回的机器人动作和输入图像写入 JSONL（一行一条记录）日志。图像会使文件快速增大并增加推理耗时，仅建议短时调试。 |
+| `--action-log-path` | `outputs/xtrainer/action_logs/actions_<UTC>.jsonl` | 自定义服务端日志路径；需同时传入 `--log-actions`。文件名时间为 UTC。 |
+
+服务端与控制机应位于可信局域网。服务端只负责模型推理；运行此命令不会连接或使能机械臂。
+
+## 13. 启动真机任务（run_real.py）
+
+### 13.1 默认启动：RTC + EMA 滤波
+
+策略服务启动完成后，在连接机械臂和相机的控制机上执行。将示例 IP 换成策略机地址，任务文本换成与训练数据一致的描述；同机部署可使用 `127.0.0.1`。
 
 ```bash
 python scripts/xtrainer/run_real.py \
-  --host 策略机的地址 \
+  --host 192.168.1.100 \
+  --port 8000 \
+  --domain-id 19 \
   --task "左手拿盒子，右手夹取，并把桌上所有的杂物放进盒子中" \
   --control-hz 30 \
-  --max-steps 10000 \
-  --bin-gripper \
-  --action-horizon 32 \
+  --max-steps 300 \
+  --joint-ema-alpha 0.25 \
+  --gripper-ema-alpha 0.5 \
+  --gripper-ema-jump-threshold 0.4 \
+  --log-control \
   --execute
 ```
 
-`run_real.py` 的参数如下。`必须传入` 表示命令行缺少该参数就无法运行；`真机必查` 表示参数已有默认值，但启动前必须确认它与 checkpoint、任务或现场硬件一致；其余参数均为按需覆盖的可选项。
+示例执行 300 个策略动作，按 30 Hz 计算约为 10 秒，不包含初始化、复位和首次推理时间，实际耗时还受通信与硬件影响。三个滤波参数已是默认值，可省略。`--execute` 显式允许真机运动；连接后客户端会校验模型信息、使能机械臂、按服务端提供的复位姿态移动，再开始执行策略。
 
-| 类型 | 参数 | 默认值 | 作用和注意事项 |
-|---|---|---|---|
-| 必须传入 | `--host` | 无 | XVLA 策略服务的 IP 地址或主机名。 |
-| 必须传入 | `--execute` | 关闭 | 显式允许连接、使能并移动真机；不传时程序会拒绝执行。仅在完成硬件检查、清空工作区并确保急停可触达后启用。 |
-| 真机必查 | `--task` | `pick up the object` | 发送给 XVLA 的任务文本，应与训练数据中的任务描述一致。中文任务可以直接传入。 |
-| 真机必查 | `--domain-id` | `19` | 客户端期望的 XVLA domain，必须与策略服务 metadata 和训练 checkpoint 一致，范围为 `[0, 30)`。 |
-| 可选 | `--port` | `8000` | 策略服务端口，必须与 `serve_policy.py` 的监听端口一致。 |
-| 可选 | `--action-horizon` | `32` | 每次策略响应最多执行的动作步数。缩短动作块时，服务端的 `--actions-per-chunk` 也应同步调整。 |
-| 可选 | `--control-hz` | `30` | 真机动作下发频率。32 步动作块在 30 Hz 下约执行 `1.07` 秒；实际频率还会受通信和硬件耗时影响。 |
-| 可选 | `--max-steps` | `1000` | 整次任务最多执行的动作步总数，不是动作块数量。首次上机建议设为较小值。 |
-| 可选 | `--camera-warmup-frames` | `10` | 每台相机启动后丢弃的预热帧数；设为 `0` 可跳过预热。 |
-| 可选 | `--image-jpeg-quality` | `85` | 三路 RGB 图像的传输 JPEG 质量，范围为 `0–100`；`0` 关闭压缩并发送原始数组。不支持 JPEG 的服务端会自动回退到原始数组。 |
-| 可选 | `--max-joint-delta` | `inf`（关闭） | 环境层单步关节变化上限，单位为弧度；默认不限制。首次上机可显式设置保守值。 |
-| 可选 | `--max-gripper-delta` | `inf`（关闭） | 环境层单步夹爪变化上限；默认不限制。首次上机可显式设置保守值。 |
-| 可选 | `--ramp-step` | `0.01` | 机器人移动到 reset pose 时使用的插值步长，不影响正常策略动作。 |
-| 可选 | `--ramp-max-steps` | `100` | reset pose 插值的最大步数。 |
-| 可选 | `--gripper-update-threshold` | `0.0` | 夹爪目标相对上次指令的最小变化量；`0` 表示发送所有变化。 |
-| 可选 | `--max-delta-per-step` | `0.0`（关闭） | 客户端最终下发前对全部 14 维动作施加的单步变化上限；小于或等于 `0` 时关闭。 |
-| 可选 | `--chunk-blend-steps` | `6` | 从第二个动作块开始，用前 N 步将双臂关节从 hold 位置平滑过渡到模型目标；不处理夹爪，也不增加动作步数。30 Hz、6 步时约过渡 `200 ms`；`0` 关闭。 |
-| 可选 | `--chunk-smoothing-strength` | `0.5` | 对每个动作块内部的双臂关节做一次三点平滑；保留首尾动作和夹爪原值。取值范围 `[0,1]`；`0` 关闭。 |
-| 可选 | `--chunk-stop-steps` | `6` | 在每个动作块最后 N 步对双臂关节做减速，并在正常结束前 hold N 个控制周期；不处理夹爪。30 Hz、6 步约为 `200 ms`；`0` 关闭。 |
-| 可选 | `--bin-gripper` | 关闭 | 左右夹爪独立判断：模型值低于 `0.5` 时，从上一次实际位置开始，每周期向闭合方向 `0` 递减 `0.05`；不低于 `0.5` 时保留模型原值。30 Hz 下从 `1` 到 `0` 约需 `0.67` 秒。 |
-| 可选 | `--log-control` | 关闭 | 将状态、模型动作和最终下发动作写入客户端 JSONL 日志。日志不保存图像，通常不会显著影响控制速度。 |
-| 可选 | `--control-log-path` | `outputs/xtrainer/control_logs/control_<UTC>.jsonl` | 自定义 `--log-control` 的日志路径；仅在启用 `--log-control` 时生效。 |
+**`run_real.py` 不读取 `deploy.yaml`，也没有 `--config` 参数。** 控制频率、相机、机械臂、滤波、超时及限幅设置均由客户端参数决定；只修改 YAML 中的 `xtrainer.control_hz`、`cameras`、`hardware` 或 `safety` 不会改变客户端的实际设置。
 
+### 13.2 RTC 与滤波如何配合
 
+RTC 负责新旧动作段的衔接；EMA（指数移动平均）负责每一步的平滑。关节默认每步从上一次实际下发目标向新目标靠近 25%；夹爪小幅变化时靠近 50%，变化超过 `0.4` 时直接通过滤波。比例越小，动作越平滑，但响应也越慢；设为 `1` 则该部分不做平滑。
+
+滤波只处理即将执行的一步，跨段连续，并以上一次经过硬件限幅后的下发目标作为参考。模型使用的旧动作前缀保持未经滤波的原值。实际处理顺序为：模型动作 → EMA / 可选夹爪模式 → 客户端限幅 → 环境层限幅 → 硬件下发。
+
+| 使用方式 | 服务端设置 | 客户端设置 |
+|---|---|---|
+| RTC + EMA（默认） | `policy.rtc.enabled: true` | 不传 `--no-ema` |
+| 仅 RTC，关闭 EMA | `policy.rtc.enabled: true` | 添加 `--no-ema` |
+| 同步分块 + EMA | `policy.rtc.enabled: false`，重启服务 | 不传 `--no-ema` |
+| 同步分块，关闭 EMA | `policy.rtc.enabled: false`，重启服务 | 添加 `--no-ema` |
+
+如需原有的逐步闭合夹爪行为，在启动命令中追加 `--bin-gripper`。此时关节仍做 EMA，夹爪不做 EMA：模型夹爪值低于 `0.5` 时，每周期从上次下发目标向闭合方向递减 `0.05`；不低于 `0.5` 时保留模型目标。后续限幅仍会生效。上面的默认示例使用连续夹爪滤波，因此没有附加此选项。
+
+**旧的 `--chunk-blend-steps`、`--chunk-smoothing-strength`、`--chunk-stop-steps` 已删除。** 启动脚本中也需要移除这些参数，不能通过传 `0` 继续保留。
+
+### 13.3 控制、滤波与日志参数
+
+| 参数 | 默认值 | 作用和注意事项 |
+|---|---|---|
+| `--host` | 必填 | 策略机的 IP 或主机名，不带 `http://`。 |
+| `--port` | `8000` | 与策略服务端口一致。 |
+| `--execute` | 关闭 | 显式允许连接、使能和移动真机；不传时程序拒绝执行。 |
+| `--task` | `pick up the object` | 提供给模型的任务文本，应与训练任务一致，支持中文。 |
+| `--domain-id` | `19` | 客户端期望的任务域编号，必须与服务端和 checkpoint 一致。 |
+| `--control-hz` | `30` | 动作下发频率，单位 Hz（每秒次数），必须大于 0。 |
+| `--max-steps` | `1000` | 最多执行的策略动作步总数，必须为正数；不含复位和退出时的保持指令。 |
+| `--action-horizon` | `32` | 仅同步分块模式生效：每次最多保留这么多步。RTC 模式忽略此值并使用服务端完整段长，但参数仍须为正数。 |
+| `--request-timeout` | `10.0` 秒 | 单次推理请求超时；RTC 动作队列可能在此之前耗尽并触发退出。 |
+| `--no-ema` | 不启用，EMA 默认开启 | 关闭关节和连续夹爪的 EMA；不关闭 RTC，也不关闭 `--bin-gripper` 或限幅。 |
+| `--joint-ema-alpha` | `0.25` | 关节滤波比例，必须是 `(0,1]` 内的有限值。 |
+| `--gripper-ema-alpha` | `0.5` | 连续夹爪滤波比例，必须是 `(0,1]` 内的有限值；启用 `--bin-gripper` 时不用于夹爪。 |
+| `--gripper-ema-jump-threshold` | `0.4` | 夹爪变化超过此阈值时直接通过 EMA；必须是有限非负数。夹爪取值范围为 `[0,1]`。 |
+| `--bin-gripper` | 关闭 | 将低于 `0.5` 的夹爪目标转为每步递减 `0.05` 的闭合指令；从 `1` 到 `0` 在 30 Hz 下约需 `0.67` 秒。 |
+| `--max-delta-per-step` | `0.0`（关闭） | 最终下发前，对全部 14 维动作施加单步变化上限；必须非负，`0` 关闭。关节为弧度、夹爪为 `[0,1]` 数值。 |
+| `--max-joint-delta` | `inf`（关闭） | 环境层单步关节变化上限，单位为弧度。 |
+| `--max-gripper-delta` | `inf`（关闭） | 环境层单步夹爪变化上限。 |
+| `--ramp-step` | `0.01` | 移动到复位姿态时的关节插值步长，单位为弧度。 |
+| `--ramp-max-steps` | `100` | 复位插值最多执行的步数。 |
+| `--gripper-update-threshold` | `0.0` | 夹爪目标相对上次指令的最小变化量，`0` 表示发送所有变化。 |
+| `--log-control` | 关闭 | 写入客户端 JSONL 日志，包括推理请求、RTC 切换、原始动作、滤波动作、实际下发动作及控制间隔；不保存图像。 |
+| `--control-log-path` | `outputs/xtrainer/control_logs/control_<UTC>.jsonl` | 自定义客户端日志路径；需同时传入 `--log-control`。文件名时间为 UTC。 |
+
+### 13.4 硬件与图像参数
+
+以下默认值对应当前 X-Trainer 配置，换控制机或硬件后应在客户端命令中覆盖。
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `--left-robot-ip` / `--left-arm-ip` | `192.168.5.1` | 左臂 IP，两种写法等价。 |
+| `--right-robot-ip` / `--right-arm-ip` | `192.168.5.2` | 右臂 IP，两种写法等价。 |
+| `--left-gripper-port` / `--right-gripper-port` | `/dev/ttyUSB1` / `/dev/ttyUSB0` | 左右夹爪串口。 |
+| `--left-gripper-id` / `--right-gripper-id` | `21` / `22` | 左右夹爪电机 ID。 |
+| `--camera-top-serial` / `--top-camera-serial` | `409122273405` | 顶部相机序列号，两种写法等价。 |
+| `--camera-left-wrist-serial` / `--left-wrist-camera-serial` | `412622272997` | 左腕相机序列号，两种写法等价。 |
+| `--camera-right-wrist-serial` / `--right-wrist-camera-serial` | `412622271417` | 右腕相机序列号，两种写法等价。 |
+| `--camera-fps` | `30` | 相机采集帧率。 |
+| `--camera-width` / `--camera-height` | `640` / `480` | 相机图像宽度、高度。 |
+| `--camera-warmup-frames` | `10` | 每台相机启动后丢弃的预热帧数，`0` 可跳过。 |
+| `--image-jpeg-quality` | `85` | 图像传输 JPEG 质量，范围 `0–100`；`0` 发送原始 RGB 数组。服务端不支持 JPEG 时自动回退。 |
+
+### 13.5 段长、延迟与排查
+
+一次模型预测生成完整动作段，客户端同时只保留一个待完成的推理请求。当剩余动作不超过 `max(15, delay + 5)` 步时提前请求下一段，其中 `delay` 是根据已观测耗时估计的延迟步数。新段返回后，按这段时间内实际执行的动作数对齐；实际经过的时间用于延迟估计和过期判断，不直接用于跳过动作。
+
+32 步、30 Hz 对应约 1.07 秒的整段时间，但这并不意味着下一次推理总有 1.07 秒可用；例如剩 15 步时才触发请求，可用执行时间约为 0.5 秒。采集、传输、模型推理和控制耗时都需要实测。客户端日志中的 `send_interval_ms` 是下发间隔，30 Hz 下目标约为 33.3 ms；`rtc_switch` 记录切换时目标差值。
+
+| 现象或报错 | 处理方法 |
+|---|---|
+| `RTC requires the full checkpoint chunk_size` | 将服务端 `--actions-per-chunk` 或 `policy.actions_per_chunk` 设为 checkpoint 的完整段长；调整客户端 `--action-horizon` 不能解决。 |
+| `supports rtc.mode='guided' only` | 将 YAML 中的 `policy.rtc.mode` 改为 `guided`，重启服务。 |
+| `RTC prefix cannot cover observed latency`、`RTC prediction expired` 或 `RTC queue exhausted` | 查看服务端推理耗时、客户端下发间隔和采集耗时；确认启动预热已完成，检查网络及模型性能。单纯增大 `--request-timeout` 不会增加队列里的动作数。 |
+| domain 不匹配 | 核对 checkpoint 中的 `domain_id`、服务端配置和客户端 `--domain-id`。 |
+| `unrecognized arguments: --chunk-...` | 从旧启动脚本中删除已移除的三个消抖参数，改用本节的 EMA 参数。 |
+
+正常 RTC 段间不再停住等待；队列耗尽、预测过期或推理失败时会退出。结束时执行器尝试发送当前测得姿态作为保持目标，随后客户端清理流程撤销机械臂使能，并关闭硬件资源和网络连接。
 
 ## 14. 关键文件索引
 
@@ -484,6 +576,7 @@ scripts/xtrainer/validate_dataset_v21.py
 scripts/xtrainer/train_xvla.sh
 scripts/xtrainer/serve_policy.py
 scripts/xtrainer/run_real.py
+deploy/xtrainer/rtc_runner.py
 configs/xtrainer/train_xvla.yaml
 configs/xtrainer/deploy.yaml
 ```
@@ -674,6 +767,8 @@ python scripts/xtrainer/serve_policy.py \
 ```
 
 同机可使用上述监听地址；跨机使用可信局域网地址或按现场网络配置监听。机器人客户端沿用第 13 节，不增加基座或 adapter 参数。切换完整模型时先停止机器人执行，再修改 checkpoint 路径并重启服务，不支持运行中热切换。
+
+该命令同样默认读取 `configs/xtrainer/deploy.yaml` 并启用 guided RTC；`--actions-per-chunk` 必须与合并模型的完整 `chunk_size` 一致，RTC 和 EMA 的设置见第 12、13 节。
 
 部署会拒绝独立 adapter、失败导出和不完整的合并产物；合并模型处理器加载失败不会回退默认预处理。
 

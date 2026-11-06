@@ -8,6 +8,7 @@ run on CPU without network access or GPU.
 from __future__ import annotations
 
 import json
+
 import numpy as np
 import pytest
 import torch
@@ -56,7 +57,8 @@ class FakePolicy:
     def reset(self):
         self.reset_calls += 1
 
-    def predict_action_chunk(self, batch):
+    def predict_action_chunk(self, batch, **kwargs):
+        self.last_kwargs = kwargs
         self.last_batch = batch
         return torch.zeros(1, self.chunk_len, ACTION_DIM)
 
@@ -68,7 +70,9 @@ class IdentityPipeline:
         return data
 
 
-def _make_policy(monkeypatch, *, fake_policy=None, load_calls=None, action_log_path=None, domain_id=None):
+def _make_policy(
+    monkeypatch, *, fake_policy=None, load_calls=None, action_log_path=None, domain_id=None, rtc=None
+):
     fake_policy = fake_policy or FakePolicy()
     load_calls = load_calls if load_calls is not None else []
 
@@ -95,6 +99,7 @@ def _make_policy(monkeypatch, *, fake_policy=None, load_calls=None, action_log_p
         camera_keys=CAMERA_KEYS,
         warmup=False,
         action_log_path=action_log_path,
+        rtc=rtc,
     )
     return policy, fake_policy
 
@@ -148,8 +153,7 @@ def test_infer_writes_action_log_when_enabled(monkeypatch, tmp_path):
     policy, _ = _make_policy(monkeypatch, action_log_path=log_path)
     payload = _valid_payload()
     payload["images"] = {
-        name: np.full((2, 3, 3), index, dtype=np.uint8)
-        for index, name in enumerate(CAMERA_KEYS)
+        name: np.full((2, 3, 3), index, dtype=np.uint8) for index, name in enumerate(CAMERA_KEYS)
     }
 
     policy.infer(payload)
@@ -306,3 +310,70 @@ def test_saved_processor_receives_device_and_domain_overrides(monkeypatch):
     assert fake_policy.config.domain_id == 19
     assert captured["preprocessor_overrides"]["device_processor"] == {"device": "cpu"}
     assert captured["preprocessor_overrides"]["xvla_add_domain_id"] == {"domain_id": 19}
+
+
+@pytest.mark.parametrize("mode", ["trained", "typo"])
+def test_rejects_unsupported_rtc_mode(monkeypatch, mode):
+    with pytest.raises(ValueError, match="guided"):
+        _make_policy(monkeypatch, rtc={"enabled": True, "mode": mode})
+
+
+def test_guided_rtc_returns_raw_model_actions_before_inplace_postprocessing(monkeypatch):
+    fake = FakePolicy()
+    fake.chunk_len = 32
+    policy, _ = _make_policy(monkeypatch, fake_policy=fake, rtc={"enabled": True, "mode": "guided"})
+    policy.postprocessor = lambda actions: actions.add_(2.0)
+    payload = _valid_payload() | {"prev_chunk_left_over": np.full((12, 14), 0.3), "inference_delay": 4}
+    result = policy.infer(payload)
+    assert policy.metadata()["rtc_enabled"] is True
+    np.testing.assert_array_equal(result["model_action"], np.zeros((32, 14)))
+    np.testing.assert_array_equal(result["action"], np.full((32, 14), 2.0))
+    assert fake.last_kwargs["inference_delay"] == 4
+    assert fake.last_kwargs["prev_chunk_left_over"].shape == (1, 12, 14)
+    assert fake.last_kwargs["rtc_processor"] is policy.rtc_processor
+    assert not torch.is_inference(fake.last_kwargs["prev_chunk_left_over"])
+
+
+@pytest.mark.parametrize(
+    "prefix,delay",
+    [
+        (np.zeros((3, 13)), 1),
+        (np.zeros((0, 14)), 0),
+        (np.zeros((33, 14)), 1),
+        (np.full((4, 14), np.nan), 1),
+        (np.zeros((4, 14)), 4),
+        (np.zeros((4, 14)), -1),
+        (np.zeros((4, 14)), True),
+        (None, 1),
+    ],
+)
+def test_rejects_invalid_rtc_prefix(monkeypatch, prefix, delay):
+    policy, _ = _make_policy(monkeypatch, rtc={"enabled": True, "mode": "guided"})
+    with pytest.raises(ValueError):
+        policy.infer(_valid_payload() | {"prev_chunk_left_over": prefix, "inference_delay": delay})
+
+
+def test_rtc_rejects_incomplete_model_output(monkeypatch):
+    policy, _ = _make_policy(monkeypatch, rtc={"enabled": True, "mode": "guided"})
+    with pytest.raises(ValueError, match="incomplete"):
+        policy.infer(_valid_payload())
+
+
+def test_rtc_requires_full_checkpoint_chunk(monkeypatch):
+    fake = FakePolicy()
+    fake.config = FakeConfig()
+    fake.config.chunk_size = 50
+    with pytest.raises(ValueError, match="full checkpoint"):
+        _make_policy(monkeypatch, fake_policy=fake, rtc={"enabled": True, "mode": "guided"})
+
+
+def test_rtc_warmup_exercises_prefix_and_preserves_rng(monkeypatch):
+    fake = FakePolicy()
+    fake.chunk_len = 32
+    policy, _ = _make_policy(monkeypatch, fake_policy=fake, rtc={"enabled": True, "mode": "guided"})
+    rng = torch.random.get_rng_state().clone()
+    policy._warmup()
+    assert fake.last_kwargs["prev_chunk_left_over"].shape == (1, 32, 14)
+    assert fake.last_kwargs["inference_delay"] == 1
+    assert fake.reset_calls == 1
+    torch.testing.assert_close(torch.random.get_rng_state(), rng)

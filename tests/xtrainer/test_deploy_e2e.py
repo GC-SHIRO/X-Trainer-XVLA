@@ -105,6 +105,58 @@ class MetadataOverrideServer(XTrainerWebSocketPolicyServer):
         return metadata
 
 
+def test_guided_rtc_roundtrip_keeps_model_prefix_raw_and_filters_robot_actions():
+    class GuidedPolicy(RecordingHoldCurrentPolicy):
+        def metadata(self):
+            return super().metadata() | {"rtc_enabled": True}
+
+        def infer(self, payload):
+            self.payloads.append(payload)
+            return {
+                "action": np.full((32, 14), 0.8, dtype=np.float32),
+                "model_action": np.full((32, 14), 0.3, dtype=np.float32),
+            }
+
+    async def exercise():
+        policy = GuidedPolicy(chunk_size=32)
+        server = XTrainerWebSocketPolicyServer(policy, port=0)
+        environment = MockHardwareEnvironment()
+        await server.start()
+        client = XTrainerWebSocketPolicyClient(f"http://127.0.0.1:{server.port}")
+        args = parse_run_args(
+            [
+                "--host",
+                "127.0.0.1",
+                "--execute",
+                "--max-steps",
+                "45",
+                "--control-hz",
+                "30",
+                "--action-horizon",
+                "1",
+            ]
+        )
+        try:
+            await run(args, policy=client, environment=environment)
+        finally:
+            await server.stop()
+        return policy, environment
+
+    policy, environment = asyncio.run(exercise())
+    assert len(policy.payloads) >= 2
+    assert policy.payloads[0]["prev_chunk_left_over"] is None
+    for request in policy.payloads[1:]:
+        prefix = request["prev_chunk_left_over"]
+        assert prefix.shape[1] == 14
+        assert 0 < request["inference_delay"] < len(prefix)
+        np.testing.assert_allclose(prefix, 0.3)
+    # Exactly 45 control targets and a final hold, no intermediate stop.
+    assert len(environment.actions) == 46
+    assert environment.actions[0][0] == pytest.approx(-0.25)
+    assert environment.actions[44][0] == pytest.approx(0.8, abs=1e-5)
+    assert environment.events[-1] == "close"
+
+
 def _run_args(port: int, *, max_steps: int = 4):
     return parse_run_args(
         [
@@ -172,10 +224,10 @@ def test_real_websocket_roundtrip_drives_bounded_mock_hardware_loop(monkeypatch)
     assert np.all(policy.payloads[0]["images"]["right_wrist"] == 33)
     assert all(image.dtype == np.uint8 for image in policy.payloads[0]["images"].values())
 
-    assert len(environment.actions) == 10
+    assert len(environment.actions) == 5
     for action in environment.actions:
         np.testing.assert_array_equal(action, _state())
-    assert environment.events == ["reset", "enable_arms", *("apply_action",) * 10, "close"]
+    assert environment.events == ["reset", "enable_arms", *("apply_action",) * 5, "close"]
     assert client._session is None
     assert client._ws is None
     assert server._runner is None

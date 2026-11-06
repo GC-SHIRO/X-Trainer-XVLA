@@ -35,6 +35,7 @@ from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..common.vla_utils import pad_vector, resize_with_pad
 from ..pretrained import PreTrainedPolicy, T
+from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import populate_queues
 from .action_hub import build_action_space
 from .configuration_xvla import XVLAConfig
@@ -241,6 +242,9 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         steps: int,
+        rtc_processor: RTCProcessor | None = None,
+        prev_chunk_left_over: Tensor | None = None,
+        inference_delay: int = 0,
     ) -> torch.Tensor:
         self.eval()
 
@@ -260,6 +264,40 @@ class XVLAModel(nn.Module):
         for i in range(steps, 0, -1):
             t = torch.full((batch_size,), i / steps, device=proprio.device, dtype=target_dtype)
             x_t = x1 * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
+            if rtc_processor is not None and prev_chunk_left_over is not None:
+                # Auto action space only trims padding; RTC operates on the real,
+                # normalized channels, never on untrained padding dimensions.
+                if self.config.action_mode.lower() != "auto":
+                    raise ValueError("XVLA RTC requires action_mode='auto'")
+                real_dim = self.action_space.real_dim
+                prediction = None
+
+                def velocity_fn(real_x_t, *, x_t=x_t, real_dim=real_dim, t=t, noise_level=i / steps):
+                    nonlocal prediction
+                    full_x_t = torch.cat((real_x_t.to(target_dtype), x_t[..., real_dim:]), dim=-1)
+                    proprio_m, x_t_m = self.action_space.preprocess(proprio, full_x_t)
+                    prediction = self.transformer(
+                        domain_id=domain_id,
+                        action_with_noise=x_t_m,
+                        proprio=proprio_m,
+                        t=t,
+                        **enc,
+                    )
+                    # XVLA predicts clean actions, whereas RTC expects velocity.
+                    return (real_x_t - prediction[..., :real_dim].float()) / noise_level
+
+                real_x_t = x_t[..., :real_dim].float()
+                velocity = rtc_processor.denoise_step(
+                    x_t=real_x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=i / steps,
+                    original_denoise_step_partial=velocity_fn,
+                    execution_horizon=max(rtc_processor.rtc_config.execution_horizon, inference_delay + 1),
+                )
+                action = prediction.detach().clone()
+                action[..., :real_dim] = (real_x_t - (i / steps) * velocity).to(target_dtype)
+                continue
             proprio_m, x_t_m = self.action_space.preprocess(proprio, x_t)
             action = self.transformer(
                 domain_id=domain_id,
@@ -398,16 +436,21 @@ class XVLAPolicy(PreTrainedPolicy):
         log_dict["loss"] = total_loss.detach().item()
         return total_loss, log_dict
 
-    def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def _get_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         inputs = self._build_model_inputs(batch)
-        actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps)
+        actions = self.model.generate_actions(**inputs, steps=self.config.num_denoising_steps, **kwargs)
         return actions
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:  # noqa: ARG002
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        **kwargs,  # noqa: ARG002
+    ) -> Tensor:
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-        return self._get_action_chunk(batch)
+        return self._get_action_chunk(batch, **kwargs)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:  # noqa: ARG002

@@ -17,12 +17,9 @@ from deploy.xtrainer.real.environment import (
 from scripts.xtrainer.run_real import (
     ControlActionLog,
     _apply_binary_gripper_close,
-    _blend_chunk_action,
-    _ease_out_action_chunk,
     _extract_action_chunk,
     _policy_payload,
     _rate_limit_action,
-    _smooth_action_chunk,
     parse_args,
     run,
     run_control_loop,
@@ -96,6 +93,7 @@ class MockPolicy:
 
     async def connect(self):
         self.connected = True
+        self.metadata = self.server_metadata
         return self.server_metadata
 
     async def reset(self):
@@ -170,126 +168,6 @@ def test_bin_gripper_smoothly_closes_values_below_threshold():
     assert transformed[0] == pytest.approx(0.8)
 
 
-def test_chunk_blend_rejoins_trajectory_without_changing_grippers():
-    anchor = np.full(14, 0.2)
-    targets = np.full((8, 14), 0.8)
-    targets[:, 0] += np.arange(8) * 0.01
-    actual = np.array([_blend_chunk_action(a, anchor, i, 6) for i, a in enumerate(targets)])
-
-    assert actual[0, 0] == pytest.approx(anchor[0])
-    assert np.all(np.diff(actual[:6, 0]) > 0)
-    np.testing.assert_array_equal(actual[:, [6, 13]], targets[:, [6, 13]])
-    np.testing.assert_array_equal(actual[5:], targets[5:])
-    np.testing.assert_array_equal(anchor, np.full(14, 0.2))
-    for steps in (0, 1):
-        np.testing.assert_array_equal(_blend_chunk_action(targets[0], anchor, 0, steps), targets[0])
-    np.testing.assert_array_equal(_blend_chunk_action(targets[0], None, 0, 6), targets[0])
-
-
-def test_chunk_smoothing_reduces_internal_spike_without_changing_ends_or_grippers():
-    actions = np.zeros((5, 14), dtype=np.float64)
-    actions[2, 0] = 1.0
-    actions[:, 6] = np.arange(5)
-    actions[:, 13] = np.arange(5) + 10
-
-    smoothed = _smooth_action_chunk(actions, strength=0.5)
-
-    assert smoothed[2, 0] == pytest.approx(0.5)
-    assert smoothed[1, 0] == pytest.approx(0.25)
-    assert smoothed[3, 0] == pytest.approx(0.25)
-    np.testing.assert_array_equal(smoothed[[0, -1]], actions[[0, -1]])
-    np.testing.assert_array_equal(smoothed[:, [6, 13]], actions[:, [6, 13]])
-    np.testing.assert_array_equal(actions[:, 0], [0, 0, 1, 0, 0])
-
-
-def test_chunk_smoothing_can_be_disabled():
-    actions = np.arange(5 * 14, dtype=np.float64).reshape(5, 14)
-
-    np.testing.assert_array_equal(_smooth_action_chunk(actions, strength=0), actions)
-
-
-def test_chunk_ease_out_reduces_final_joint_increment_and_preserves_grippers():
-    actions = np.zeros((6, 14), dtype=np.float64)
-    actions[:, 0] = np.linspace(0.0, 1.0, 6)
-    actions[:, 6] = np.arange(6)
-    actions[:, 13] = np.arange(6) + 10
-
-    eased = _ease_out_action_chunk(actions, stop_steps=6)
-
-    np.testing.assert_array_equal(eased[[0, -1], 0], actions[[0, -1], 0])
-    assert eased[-1, 0] - eased[-2, 0] < actions[-1, 0] - actions[-2, 0]
-    np.testing.assert_array_equal(eased[:, [6, 13]], actions[:, [6, 13]])
-    np.testing.assert_array_equal(actions[:, 0], np.linspace(0.0, 1.0, 6))
-
-
-def test_chunk_ease_out_can_be_disabled():
-    actions = np.arange(5 * 14, dtype=np.float64).reshape(5, 14)
-
-    np.testing.assert_array_equal(_ease_out_action_chunk(actions, stop_steps=0), actions)
-
-
-def test_control_loop_applies_chunk_smoothing_before_sending_actions():
-    async def exercise():
-        chunk = np.zeros((5, 14), dtype=np.float64)
-        chunk[2, 0] = 1.0
-        environment = MockEnvironment()
-        await run_control_loop(
-            MockPolicy([chunk]),
-            environment,
-            action_horizon=5,
-            control_hz=30,
-            max_steps=5,
-            request_timeout_s=1,
-            max_delta_per_step=0,
-            chunk_blend_steps=0,
-            chunk_smoothing_strength=0.5,
-            chunk_stop_steps=0,
-            monotonic_fn=lambda: 0,
-            sleep_fn=lambda _seconds: asyncio.sleep(0),
-        )
-        return np.asarray(environment.actions)
-
-    actions = asyncio.run(exercise())
-
-    np.testing.assert_allclose(actions[:, 0], [0, 0.25, 0.5, 0.25, 0])
-
-
-def test_control_loop_eases_out_and_holds_before_normal_shutdown():
-    class TrackingEnvironment(MockEnvironment):
-        def get_observation(self):
-            observation = _observation()
-            if self.actions:
-                observation[STATE_KEY] = self.actions[-1].astype(np.float32)
-            return observation
-
-    async def exercise():
-        chunk = np.zeros((6, 14), dtype=np.float64)
-        chunk[:, 0] = np.linspace(0.0, 1.0, 6)
-        environment = TrackingEnvironment()
-
-        await run_control_loop(
-            MockPolicy([chunk]),
-            environment,
-            action_horizon=6,
-            control_hz=30,
-            max_steps=6,
-            request_timeout_s=1,
-            max_delta_per_step=0,
-            chunk_blend_steps=0,
-            chunk_smoothing_strength=0,
-            chunk_stop_steps=6,
-            monotonic_fn=lambda: 0,
-            sleep_fn=lambda _seconds: asyncio.sleep(0),
-        )
-        return np.asarray(environment.actions)
-
-    actions = asyncio.run(exercise())
-
-    assert len(actions) == 12
-    assert actions[5, 0] - actions[4, 0] < 0.2
-    np.testing.assert_allclose(actions[5:, 0], 1.0)
-
-
 def test_cli_uses_planned_camera_defaults():
     args = parse_args(["--host", "127.0.0.1"])
 
@@ -308,9 +186,10 @@ def test_cli_uses_planned_camera_defaults():
     assert math.isinf(args.max_joint_delta)
     assert math.isinf(args.max_gripper_delta)
     assert args.max_delta_per_step == 0.0
-    assert args.chunk_blend_steps == 6
-    assert args.chunk_smoothing_strength == pytest.approx(0.5)
-    assert args.chunk_stop_steps == 6
+    assert args.no_ema is False
+    assert args.joint_ema_alpha == pytest.approx(0.25)
+    assert args.gripper_ema_alpha == pytest.approx(0.5)
+    assert args.gripper_ema_jump_threshold == pytest.approx(0.4)
     assert args.ramp_step == pytest.approx(0.01)
     assert args.ramp_max_steps == 100
     assert args.gripper_update_threshold == 0.0
@@ -335,14 +214,6 @@ def test_cli_rejects_invalid_jpeg_quality():
     args = parse_args(["--host", "127.0.0.1", "--image-jpeg-quality", "101"])
 
     with pytest.raises(ValueError, match="image_jpeg_quality"):
-        asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))
-
-
-@pytest.mark.parametrize("strength", ["-0.1", "1.1"])
-def test_cli_rejects_invalid_chunk_smoothing_strength(strength):
-    args = parse_args(["--host", "127.0.0.1", "--chunk-smoothing-strength", strength])
-
-    with pytest.raises(ValueError, match="chunk_smoothing_strength"):
         asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))
 
 
@@ -371,6 +242,8 @@ def test_cli_accepts_reference_hardware_option_names():
         "left",
         "right",
     )
+
+
 def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
     async def exercise():
         policy = MockPolicy([np.zeros((4, 14)), np.full((4, 14), 10.0)])
@@ -386,10 +259,9 @@ def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
             action_horizon=4,
             control_hz=20.0,
             max_steps=5,
+            ema_enabled=False,
             request_timeout_s=1.0,
             max_delta_per_step=0.0,
-            chunk_blend_steps=0,
-            chunk_stop_steps=0,
             monotonic_fn=lambda: 0.0,
             sleep_fn=yield_control,
         )
@@ -397,57 +269,13 @@ def test_control_loop_executes_complete_chunks_then_holds_measured_pose():
 
     policy, environment = asyncio.run(exercise())
 
-    assert len(environment.actions) == 6
+    assert len(environment.actions) == 7
     np.testing.assert_allclose(environment.actions[:5], 0.0)
     np.testing.assert_allclose(environment.actions[5], 10.0)
     assert policy.infer_calls == 2
     assert policy.max_active_infers == 1
     assert set(policy.payloads[0]) == {"state", "images", "task"}
     assert set(policy.payloads[0]["images"]) == {"top", "left_wrist", "right_wrist"}
-
-
-def test_control_loop_blends_from_applied_hold_without_extra_steps(tmp_path):
-    class LimitedHoldEnvironment(MockEnvironment):
-        def apply_action(self, action, *, pace=True):
-            # 模拟 hold 经环境处理后与请求值不同，过渡必须从实际下发值起步。
-            if len(self.actions) == 4:
-                action = np.full(14, 0.2)
-            return super().apply_action(action, pace=pace)
-
-    async def exercise():
-        environment = LimitedHoldEnvironment()
-        policy = MockPolicy([np.full((4, 14), 0.1), np.full((4, 14), 0.8)])
-        sleeps = []
-
-        async def sleep(seconds):
-            sleeps.append(seconds)
-
-        log = ControlActionLog(tmp_path / "blend.jsonl")
-        try:
-            await run_control_loop(
-                policy, environment, action_horizon=4, control_hz=30, max_steps=8,
-                request_timeout_s=1, max_delta_per_step=0, chunk_blend_steps=6,
-                chunk_stop_steps=0,
-                control_log=log, monotonic_fn=lambda: 0, sleep_fn=sleep,
-            )
-        finally:
-            log.close()
-        assert len(sleeps) == 8
-        assert policy.infer_calls == 2
-        assert policy.max_active_infers == 1
-        return environment.actions
-
-    actions = np.array(asyncio.run(exercise()))
-    assert len(actions) == 9
-    np.testing.assert_allclose(actions[:4], 0.1)
-    np.testing.assert_allclose(actions[4], 0.2)
-    assert actions[5, 0] == pytest.approx(0.2)
-    np.testing.assert_allclose(actions[5:, [6, 13]], 0.8)
-    np.testing.assert_allclose(actions[-1], 0.8)
-    records = [json.loads(line) for line in (tmp_path / "blend.jsonl").read_text().splitlines()]
-    steps = [r for r in records if r['event'] == 'control_step']
-    assert steps[4]['queued_action'][0] == 0.8
-    assert steps[4]['blended_action'][0] == pytest.approx(actions[5, 0])
 
 
 def test_control_loop_records_hold_without_fallback(tmp_path):
@@ -464,7 +292,6 @@ def test_control_loop_records_hold_without_fallback(tmp_path):
                 max_steps=3,
                 request_timeout_s=1.0,
                 max_delta_per_step=0.0,
-                chunk_stop_steps=0,
                 control_log=control_log,
             )
         finally:
@@ -483,6 +310,7 @@ def test_control_loop_records_hold_without_fallback(tmp_path):
         "inference_request",
         "inference_response",
         "control_step",
+        "control_stop_hold",
     ]
     assert records[4]["control_timestep"] == 2
     assert all(not record.get("used_fallback", False) for record in records)
@@ -502,7 +330,6 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
                 max_steps=1,
                 request_timeout_s=1.0,
                 max_delta_per_step=0.0,
-                chunk_stop_steps=0,
                 control_log=control_log,
                 monotonic_fn=lambda: 0.0,
                 sleep_fn=asyncio.sleep,
@@ -518,6 +345,7 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
         "inference_request",
         "inference_response",
         "control_step",
+        "control_stop_hold",
     ]
     assert records[0]["state"] == [0.0] * 14
     assert records[0]["task"] == "pick"
@@ -525,8 +353,9 @@ def test_client_control_log_records_state_response_and_applied_action(tmp_path):
     assert records[2]["source_observation_timestep"] == 0
     assert records[2]["used_fallback"] is False
     assert records[2]["queued_action"] == [0.25] * 14
-    assert records[2]["rate_limited_action"] == [0.25] * 14
-    assert records[2]["applied_action"] == [0.25] * 14
+    assert records[2]["rate_limited_action"] == records[2]["filtered_action"]
+    assert records[2]["filtered_action"][0] == pytest.approx(0.0625)
+    assert records[2]["applied_action"] == records[2]["filtered_action"]
 
 
 def test_chunk_request_timeout_closes_policy_and_hardware():
@@ -607,3 +436,21 @@ def test_run_requires_explicit_execute_before_connecting_resources():
 
     assert not policy.connected
     assert not environment.reset_called
+
+
+@pytest.mark.parametrize(
+    "option", ["--chunk-blend-steps", "--chunk-smoothing-strength", "--chunk-stop-steps"]
+)
+def test_cli_rejects_removed_smoothing_options(option):
+    with pytest.raises(SystemExit):
+        parse_args(["--host", "localhost", option, "0"])
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [("--joint-ema-alpha", "0"), ("--gripper-ema-alpha", "nan"), ("--gripper-ema-jump-threshold", "-1")],
+)
+def test_cli_rejects_invalid_ema(option, value):
+    args = parse_args(["--host", "localhost", option, value])
+    with pytest.raises(ValueError, match="ema"):
+        asyncio.run(run(args, policy=MockPolicy([np.zeros((1, 14))]), environment=MockEnvironment()))

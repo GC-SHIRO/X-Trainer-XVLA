@@ -11,7 +11,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +42,7 @@ from deploy.xtrainer.real.hardware.realsense_camera import (
     TOP_CAMERA_SERIAL,
     build_xtrainer_cameras,
 )
+from deploy.xtrainer.rtc_runner import execute_chunks, validate_ema_config
 from deploy.xtrainer.websocket_client_policy import XTrainerWebSocketPolicyClient
 
 ACTION_DIM = 14
@@ -53,12 +53,6 @@ BIN_GRIPPER_THRESHOLD = 0.5
 BIN_GRIPPER_CLOSE_STEP = 0.05
 DEFAULT_CONTROL_LOG_DIR = REPO_ROOT / "outputs" / "xtrainer" / "control_logs"
 _LOGGER = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class InferenceResult:
-    actions: np.ndarray
-    observation_timestep: int
 
 
 class ControlActionLog:
@@ -146,65 +140,6 @@ def _rate_limit_action(
     return previous + np.clip(target - previous, -max_delta_per_step, max_delta_per_step)
 
 
-def _blend_chunk_action(
-    action: np.ndarray, anchor: np.ndarray | None, index: int, blend_steps: int
-) -> np.ndarray:
-    """仅在新段开头混合关节目标，夹爪保持原值。"""
-    target = np.asarray(action, dtype=np.float64).copy()
-    if anchor is None or blend_steps <= 1 or index >= blend_steps - 1:
-        return target
-    # 首步严格保持 hold 位置，随后平滑过渡，最后一步精确恢复原轨迹。
-    progress = index / (blend_steps - 1)
-    weight = progress * progress * (3.0 - 2.0 * progress)
-    joints = np.r_[0:6, 7:13]
-    target[joints] = anchor[joints] + weight * (target[joints] - anchor[joints])
-    return target
-
-
-def _smooth_action_chunk(actions: np.ndarray, strength: float) -> np.ndarray:
-    """对动作段内部的关节目标做一次三点平滑，保留首尾和夹爪。"""
-    chunk = np.asarray(actions, dtype=np.float64)
-    if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM:
-        raise ValueError(f"Expected action chunk shape (N, {ACTION_DIM}), got {chunk.shape}")
-    if not 0.0 <= strength <= 1.0:
-        raise ValueError("chunk smoothing strength must be in [0, 1]")
-
-    smoothed = chunk.copy()
-    if strength <= 0.0 or len(chunk) < 3:
-        return smoothed
-
-    joints = np.r_[0:6, 7:13]
-    neighbor_mean = 0.5 * (chunk[:-2, joints] + chunk[2:, joints])
-    smoothed[1:-1, joints] = (
-        (1.0 - strength) * chunk[1:-1, joints] + strength * neighbor_mean
-    )
-    return smoothed
-
-
-def _ease_out_action_chunk(actions: np.ndarray, stop_steps: int) -> np.ndarray:
-    """让动作段尾部的关节增量逐渐减小，夹爪和最终目标保持不变。"""
-    chunk = np.asarray(actions, dtype=np.float64)
-    if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM:
-        raise ValueError(f"Expected action chunk shape (N, {ACTION_DIM}), got {chunk.shape}")
-    if stop_steps < 0:
-        raise ValueError("chunk stop steps must be non-negative")
-
-    eased = chunk.copy()
-    steps = min(stop_steps, len(chunk))
-    if steps < 3:
-        return eased
-
-    tail_start = len(chunk) - steps
-    progress = np.linspace(0.0, 1.0, steps)
-    # 起始斜率保持接近原轨迹，末端斜率降为 0，避免到达 hold 时瞬停。
-    weight = progress + progress**2 - progress**3
-    joints = np.r_[0:6, 7:13]
-    start = chunk[tail_start, joints]
-    end = chunk[-1, joints]
-    eased[tail_start:, joints] = start + weight[:, None] * (end - start)
-    return eased
-
-
 def _crop_top_image(image: np.ndarray) -> np.ndarray:
     """Match the top-camera crop used while collecting the X-trainer dataset."""
     height, width, _ = image.shape
@@ -229,6 +164,7 @@ def _flip_vertical(image: np.ndarray) -> np.ndarray:
 def _flip_horizontal(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image[:, ::-1])
 
+
 def _policy_payload(observation: dict[str, Any]) -> dict[str, Any]:
     return {
         "state": observation[STATE_KEY],
@@ -241,47 +177,6 @@ def _policy_payload(observation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _request_action_chunk(
-    policy: Any,
-    observation: dict[str, Any],
-    *,
-    action_horizon: int,
-    observation_timestep: int,
-    request_timeout_s: float,
-    control_log: ControlActionLog | None = None,
-) -> InferenceResult:
-    payload = _policy_payload(observation)
-    if control_log is not None:
-        control_log.write(
-            "inference_request",
-            observation_timestep=observation_timestep,
-            state=np.asarray(payload["state"], dtype=np.float64).tolist(),
-            task=str(payload["task"]),
-        )
-    response = await asyncio.wait_for(policy.infer(payload), timeout=request_timeout_s)
-    selected_actions = _extract_action_chunk(response, action_horizon)
-    raw_actions = np.asarray(response["action"])
-    returned_count = 1 if raw_actions.ndim == 1 else raw_actions.shape[0]
-    if control_log is not None:
-        control_log.write(
-            "inference_response",
-            observation_timestep=observation_timestep,
-            returned_action_count=int(returned_count),
-            retained_actions=selected_actions.tolist(),
-        )
-    _LOGGER.info(
-        "Policy inference for observation step %d returned %d actions; client retained %d (action horizon=%d)",
-        observation_timestep,
-        returned_count,
-        len(selected_actions),
-        action_horizon,
-    )
-    return InferenceResult(
-        actions=selected_actions,
-        observation_timestep=observation_timestep,
-    )
-
-
 async def run_control_loop(
     policy: Any,
     environment: Any,
@@ -291,148 +186,37 @@ async def run_control_loop(
     max_steps: int,
     request_timeout_s: float,
     max_delta_per_step: float,
-    chunk_blend_steps: int = 6,
-    chunk_smoothing_strength: float = 0.5,
-    chunk_stop_steps: int = 6,
+    ema_enabled: bool = True,
+    joint_ema_alpha: float = 0.25,
+    gripper_ema_alpha: float = 0.5,
+    gripper_ema_jump_threshold: float = 0.4,
     bin_gripper: bool = False,
     control_log: ControlActionLog | None = None,
     monotonic_fn: Any = time.monotonic,
     sleep_fn: Any = asyncio.sleep,
 ) -> None:
-    """Execute complete policy chunks and hold while waiting for the next one.
-
-    XVLA samples an internally coherent action chunk.  Replacing actions in
-    that chunk with a newly sampled overlapping chunk made the real robot
-    switch targets mid-motion.  This runner deliberately executes each chunk
-    in order.  Once it is exhausted, it samples the real robot state, commands
-    that measured pose as a hold target, and waits for the next inference
-    result before issuing another policy action.
-    """
-    if chunk_blend_steps < 0:
-        raise ValueError("chunk_blend_steps must be non-negative")
-    if not 0.0 <= chunk_smoothing_strength <= 1.0:
-        raise ValueError("chunk_smoothing_strength must be in [0, 1]")
-    if chunk_stop_steps < 0:
-        raise ValueError("chunk stop steps must be non-negative")
-    initial_observation = environment.get_observation()
-    initial_result = await _request_action_chunk(
+    """Execute guided RTC (or sequential chunks) with per-step EMA filtering."""
+    await execute_chunks(
         policy,
-        initial_observation,
+        environment,
+        payload_fn=_policy_payload,
+        extract_fn=_extract_action_chunk,
+        rate_limit_fn=_rate_limit_action,
+        gripper_fn=_apply_binary_gripper_close if bin_gripper else None,
+        state_key=STATE_KEY,
         action_horizon=action_horizon,
-        observation_timestep=0,
-        request_timeout_s=request_timeout_s,
-        control_log=control_log,
+        control_hz=control_hz,
+        max_steps=max_steps,
+        timeout=request_timeout_s,
+        max_delta=max_delta_per_step,
+        log=control_log,
+        clock=monotonic_fn,
+        sleep=sleep_fn,
+        ema_enabled=ema_enabled,
+        joint_ema_alpha=joint_ema_alpha,
+        gripper_ema_alpha=gripper_ema_alpha,
+        gripper_ema_jump_threshold=gripper_ema_jump_threshold,
     )
-    _LOGGER.info(
-        "Initial inference returned %d actions; client action horizon is %d",
-        len(initial_result.actions),
-        action_horizon,
-    )
-    last_sent_action: np.ndarray | None = None
-    last_gripper_action = np.asarray(initial_observation[STATE_KEY], dtype=np.float64).copy()
-    period = 1.0 / control_hz
-    result = initial_result
-    step = 0
-
-    while step < max_steps:
-        deadline = monotonic_fn()
-        # 首段不处理；后续段固定使用已下发的 hold 作为过渡起点。
-        blend_anchor = last_sent_action.copy() if last_sent_action is not None else None
-        active_actions = result.actions[: max_steps - step]
-        blend_steps = min(chunk_blend_steps, len(active_actions))
-        smoothed_actions = _smooth_action_chunk(active_actions, chunk_smoothing_strength)
-        decelerated_actions = _ease_out_action_chunk(smoothed_actions, chunk_stop_steps)
-        for action_index, (action, smoothed_action, decelerated_action) in enumerate(
-            zip(active_actions, smoothed_actions, decelerated_actions, strict=True)
-        ):
-            queued_action = np.asarray(action, dtype=np.float64).copy()
-            blended_action = _blend_chunk_action(
-                decelerated_action, blend_anchor, action_index, blend_steps
-            )
-            bin_gripper_action = (
-                _apply_binary_gripper_close(blended_action, last_gripper_action)
-                if bin_gripper
-                else blended_action
-            )
-            rate_limited_action = _rate_limit_action(
-                bin_gripper_action, last_sent_action, max_delta_per_step
-            )
-            applied_action = environment.apply_action(rate_limited_action, pace=False)
-            last_sent_action = np.asarray(applied_action, dtype=np.float64).copy()
-            last_gripper_action = last_sent_action
-            if control_log is not None:
-                control_log.write(
-                    "control_step",
-                    control_timestep=step,
-                    source_observation_timestep=result.observation_timestep,
-                    used_fallback=False,
-                    queued_action=queued_action.tolist(),
-                    smoothed_action=smoothed_action.tolist(),
-                    decelerated_action=decelerated_action.tolist(),
-                    blended_action=blended_action.tolist(),
-                    bin_gripper_action=bin_gripper_action.tolist() if bin_gripper else None,
-                    rate_limited_action=rate_limited_action.tolist(),
-                    applied_action=last_sent_action.tolist(),
-                )
-            step += 1
-            deadline += period
-            remaining = deadline - monotonic_fn()
-            if remaining > 0:
-                await sleep_fn(remaining)
-            else:
-                deadline = monotonic_fn()
-
-        if step >= max_steps:
-            break
-
-        observation = environment.get_observation()
-        hold_action = np.asarray(observation[STATE_KEY], dtype=np.float64)
-        applied_hold_action = environment.apply_action(hold_action, pace=False)
-        last_sent_action = np.asarray(applied_hold_action, dtype=np.float64).copy()
-        last_gripper_action = last_sent_action
-        if control_log is not None:
-            control_log.write(
-                "control_hold",
-                control_timestep=step,
-                hold_action=hold_action.tolist(),
-                applied_action=last_sent_action.tolist(),
-            )
-        _LOGGER.info(
-            "Completed action chunk at control step %d; holding measured pose while requesting replacement",
-            step,
-        )
-        result = await _request_action_chunk(
-            policy,
-            observation,
-            action_horizon=action_horizon,
-            observation_timestep=step,
-            request_timeout_s=request_timeout_s,
-            control_log=control_log,
-        )
-
-    if chunk_stop_steps > 0 and last_sent_action is not None:
-        observation = environment.get_observation()
-        hold_action = np.asarray(observation[STATE_KEY], dtype=np.float64)
-        deadline = monotonic_fn()
-        for hold_index in range(chunk_stop_steps):
-            applied_hold_action = environment.apply_action(hold_action, pace=False)
-            last_sent_action = np.asarray(applied_hold_action, dtype=np.float64).copy()
-            if control_log is not None:
-                control_log.write(
-                    "control_stop_hold",
-                    control_timestep=step,
-                    hold_index=hold_index,
-                    hold_action=hold_action.tolist(),
-                    applied_action=last_sent_action.tolist(),
-                )
-            deadline += period
-            remaining = deadline - monotonic_fn()
-            if remaining > 0:
-                await sleep_fn(remaining)
-            else:
-                deadline = monotonic_fn()
-
-    _LOGGER.info("Reached --max-steps=%d; ending the control loop", max_steps)
 
 
 def _apply_binary_gripper_close(action: np.ndarray, previous_action: np.ndarray) -> np.ndarray:
@@ -527,12 +311,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--control-hz", type=float, default=30.0)
     parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument(
-        "--left-robot-ip", "--left-arm-ip", dest="left_robot_ip", default="192.168.5.1"
-    )
-    parser.add_argument(
-        "--right-robot-ip", "--right-arm-ip", dest="right_robot_ip", default="192.168.5.2"
-    )
+    parser.add_argument("--left-robot-ip", "--left-arm-ip", dest="left_robot_ip", default="192.168.5.1")
+    parser.add_argument("--right-robot-ip", "--right-arm-ip", dest="right_robot_ip", default="192.168.5.2")
     parser.add_argument("--left-gripper-port", default="/dev/ttyUSB1")
     parser.add_argument("--right-gripper-port", default="/dev/ttyUSB0")
     parser.add_argument("--left-gripper-id", type=int, default=21)
@@ -599,27 +379,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Optional final client-side action delta limit; <=0 disables it",
     )
-    parser.add_argument(
-        "--chunk-blend-steps",
-        type=int,
-        default=6,
-        help="Blend joints from hold over the first N actions of each new chunk; 0 disables it",
-    )
-    parser.add_argument(
-        "--chunk-smoothing-strength",
-        type=float,
-        default=0.5,
-        help="Three-point smoothing strength for joints inside each chunk; 0 disables it",
-    )
-    parser.add_argument(
-        "--chunk-stop-steps",
-        type=int,
-        default=6,
-        help=(
-            "Ease out joints over the last N actions and hold N cycles before normal shutdown; "
-            "0 disables it"
-        ),
-    )
+    parser.add_argument("--no-ema", action="store_true", help="Disable per-step EMA filtering")
+    parser.add_argument("--joint-ema-alpha", type=float, default=0.25)
+    parser.add_argument("--gripper-ema-alpha", type=float, default=0.5)
+    parser.add_argument("--gripper-ema-jump-threshold", type=float, default=0.4)
     parser.add_argument(
         "--bin-gripper",
         action="store_true",
@@ -677,15 +440,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         "ramp_max_steps": args.ramp_max_steps,
         "gripper_update_threshold": args.gripper_update_threshold,
         "max_delta_per_step": args.max_delta_per_step,
-        "chunk_blend_steps": args.chunk_blend_steps,
-        "chunk_smoothing_strength": args.chunk_smoothing_strength,
-        "chunk_stop_steps": args.chunk_stop_steps,
     }
     invalid = [name for name, value in non_negative_values.items() if value < 0]
     if invalid:
         raise ValueError(f"Expected non-negative values for: {', '.join(invalid)}")
-    if args.chunk_smoothing_strength > 1:
-        raise ValueError("chunk_smoothing_strength must be in [0, 1]")
+    validate_ema_config(args.joint_ema_alpha, args.gripper_ema_alpha, args.gripper_ema_jump_threshold)
 
 
 async def run(
@@ -696,7 +455,9 @@ async def run(
 ) -> None:
     _validate_args(args)
     if not args.execute:
-        raise RuntimeError("Real-robot motion is disabled; pass --execute only after completing safety checks")
+        raise RuntimeError(
+            "Real-robot motion is disabled; pass --execute only after completing safety checks"
+        )
 
     policy = policy or XTrainerWebSocketPolicyClient(
         f"http://{args.host}:{args.port}", image_jpeg_quality=args.image_jpeg_quality
@@ -726,9 +487,10 @@ async def run(
             max_steps=args.max_steps,
             request_timeout_s=args.request_timeout,
             max_delta_per_step=args.max_delta_per_step,
-            chunk_blend_steps=args.chunk_blend_steps,
-            chunk_smoothing_strength=args.chunk_smoothing_strength,
-            chunk_stop_steps=args.chunk_stop_steps,
+            ema_enabled=not args.no_ema,
+            joint_ema_alpha=args.joint_ema_alpha,
+            gripper_ema_alpha=args.gripper_ema_alpha,
+            gripper_ema_jump_threshold=args.gripper_ema_jump_threshold,
             bin_gripper=args.bin_gripper,
             control_log=control_log,
         )
