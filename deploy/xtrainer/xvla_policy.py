@@ -19,6 +19,7 @@ semantics.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
@@ -30,7 +31,7 @@ import torch
 
 from deploy.xtrainer.checkpoint_validation import validate_deployment_checkpoint
 from lerobot.policies import make_pre_post_processors
-from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
+from lerobot.policies.xvla.modeling_xvla import XVLAModel, XVLAPolicy
 from lerobot.policies.xvla.processor_xvla import make_xvla_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -71,16 +72,20 @@ class XVLAXTrainerPolicy:
         self._action_log_path = Path(action_log_path) if action_log_path is not None else None
         self._action_log_file = None
 
-        self._is_merged_export = validate_deployment_checkpoint(checkpoint)
-        self.policy = self._load_policy(checkpoint, device)
-        self._resolve_domain_id()
-        self._validate_policy_contract()
-        self.rtc_processor = None
         rtc_options = dict(rtc or {})
         mode = rtc_options.pop("mode", "guided")
         if mode != "guided":
             raise ValueError("XVLA deployment supports rtc.mode='guided' only")
         self.rtc_enabled = bool(rtc_options.get("enabled", False))
+        logger.info("XVLA model implementation: %s", inspect.getfile(XVLAPolicy))
+        if self.rtc_enabled:
+            self._validate_rtc_support()
+
+        self._is_merged_export = validate_deployment_checkpoint(checkpoint)
+        self.policy = self._load_policy(checkpoint, device)
+        self._resolve_domain_id()
+        self._validate_policy_contract()
+        self.rtc_processor = None
         if self.rtc_enabled:
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
             from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -102,6 +107,31 @@ class XVLAXTrainerPolicy:
             self._warmup()
         if self._action_log_path is not None:
             self._open_action_log()
+
+    @staticmethod
+    def _validate_rtc_support() -> None:
+        """Reject mixed deployment/model revisions before loading model weights."""
+        required = {"rtc_processor", "prev_chunk_left_over", "inference_delay"}
+        for owner, name in (
+            (XVLAPolicy, "predict_action_chunk"),
+            (XVLAPolicy, "_get_action_chunk"),
+            (XVLAModel, "generate_actions"),
+        ):
+            method = getattr(owner, name, None)
+            parameters = inspect.signature(method).parameters if method is not None else {}
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            accepts_named = all(
+                key in parameters and parameters[key].kind != inspect.Parameter.POSITIONAL_ONLY
+                for key in required
+            )
+            if not accepts_kwargs and not accepts_named:
+                raise RuntimeError(
+                    f"Loaded {owner.__name__}.{name} does not support guided RTC. "
+                    f"Model source: {inspect.getfile(owner)}. "
+                    "Update src/lerobot/policies/xvla/modeling_xvla.py together with the deployment files. "
+                    "From the updated repository root, run `python -m pip install --no-deps -e .` "
+                    "in the serving environment, then restart serve_policy.py."
+                )
 
     def _load_policy(self, checkpoint: str, device: str) -> XVLAPolicy:
         policy = XVLAPolicy.from_pretrained(checkpoint)

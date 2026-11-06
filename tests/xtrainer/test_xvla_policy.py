@@ -112,6 +112,18 @@ def _valid_payload():
     }
 
 
+@pytest.mark.parametrize("stage", ["predict_action_chunk", "_get_action_chunk", "generate_actions"])
+def test_rejects_old_rtc_model_code_before_loading_checkpoint(monkeypatch, stage):
+    owner = xvla_policy_module.XVLAModel if stage == "generate_actions" else xvla_policy_module.XVLAPolicy
+    monkeypatch.setattr(owner, stage, lambda self, batch: None)
+    load_calls = []
+    with pytest.raises(RuntimeError, match=f"{stage} does not support guided RTC") as error:
+        _make_policy(monkeypatch, load_calls=load_calls, rtc={"enabled": True, "mode": "guided"})
+    assert load_calls == []
+    assert "Model source:" in str(error.value)
+    assert "pip install --no-deps -e ." in str(error.value)
+
+
 def test_infer_returns_expected_action_shape(monkeypatch):
     policy, fake_policy = _make_policy(monkeypatch)
 

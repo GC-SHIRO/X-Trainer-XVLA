@@ -17,8 +17,13 @@ from pathlib import Path
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# This launcher must pair its deployment adapter with this checkout's model
+# code, even if another LeRobot installation is present in the environment.
+for source_path in (REPO_ROOT, REPO_ROOT / "src"):
+    source = str(source_path)
+    if source in sys.path:
+        sys.path.remove(source)
+    sys.path.insert(0, source)
 
 from deploy.xtrainer.xvla_policy import XVLAXTrainerPolicy
 from deploy.xtrainer.websocket_policy_server import XTrainerWebSocketPolicyServer

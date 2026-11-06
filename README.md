@@ -562,6 +562,8 @@ RTC 负责新旧动作段的衔接；EMA（指数移动平均）负责每一步�
 | `supports rtc.mode='guided' only` | 将 YAML 中的 `policy.rtc.mode` 改为 `guided`，重启服务。 |
 | `RTC prefix cannot cover observed latency`、`RTC prediction expired` 或 `RTC queue exhausted` | 查看服务端推理耗时、客户端下发间隔和采集耗时；确认启动预热已完成，检查网络及模型性能。单纯增大 `--request-timeout` 不会增加队列里的动作数。 |
 | domain 不匹配 | 核对 checkpoint 中的 `domain_id`、服务端配置和客户端 `--domain-id`。 |
+| `unexpected keyword argument 'rtc_processor'` 或 `does not support guided RTC` | 部署代码与模型代码版本不一致。确认 `src/lerobot/policies/xvla/modeling_xvla.py` 和部署文件都已更新；在当前 Conda 环境、仓库根目录执行 `python -m pip install --no-deps -e .` 后重启服务。新版启动脚本优先使用当前仓库的 `src`，并打印 `XVLA model implementation` 路径供核对。 |
+| `Connect call failed ('127.0.0.1', 8000)` | 确认策略服务没有在加载或预热阶段报错，并已开始监听；跨机部署时客户端 `--host` 应填写策略机实际 IP，`127.0.0.1` 只指向客户端本机。 |
 | `unrecognized arguments: --chunk-...` | 从旧启动脚本中删除已移除的三个消抖参数，改用本节的 EMA 参数。 |
 
 正常 RTC 段间不再停住等待；队列耗尽、预测过期或推理失败时会退出。结束时执行器尝试发送当前测得姿态作为保持目标，随后客户端清理流程撤销机械臂使能，并关闭硬件资源和网络连接。
